@@ -21,6 +21,13 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 const claudeSSEHeartbeatInterval = 15 * time.Second
+const claudeProgressGuardMaxBytes = 768
+
+var errClaudeProgressOnlyResponse = errors.New("upstream response ended with a progress update before completing the requested tool work")
+
+var claudeProgressGuardActions = []string{
+	"查看", "检查", "核对", "确认", "分析", "追踪", "继续",
+}
 
 const (
 	microsoftProfileSelectionTTL          = 10 * time.Minute
@@ -43,6 +50,101 @@ func looksLikeKiroAPIKey(value string) bool {
 		value = strings.TrimSpace(value[:idx])
 	}
 	return strings.HasPrefix(value, "ksk_")
+}
+
+func normalizeClaudeProgressGuardText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	text = strings.NewReplacer(
+		"。", ".",
+		"！", ".",
+		"？", ".",
+		"；", ".",
+		"\r", " ",
+		"\n", " ",
+	).Replace(text)
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func startsWithClaudeProgressAction(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range []string{"我会", "我将", "我先", "会", "将", "先", "需要"} {
+		text = strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	}
+	for _, action := range claudeProgressGuardActions {
+		if strings.HasPrefix(text, action) {
+			return true
+		}
+	}
+	return false
+}
+
+func startsWithEnglishProgressAction(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, prefix := range []string{"i'll ", "i will ", "let me ", "now "} {
+		text = strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	}
+	for _, action := range []string{"inspect ", "check ", "review ", "investigate ", "trace ", "verify ", "continue ", "read ", "search ", "run ", "open ", "look "} {
+		if strings.HasPrefix(text, action) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchClaudeProgressOnlyResponse recognizes only short, explicit statements
+// that promise another action instead of completing the current tool-driven turn.
+func matchClaudeProgressOnlyResponse(text string) (string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || len([]byte(trimmed)) > claudeProgressGuardMaxBytes {
+		return "", false
+	}
+	normalized := normalizeClaudeProgressGuardText(trimmed)
+
+	for _, marker := range []string{
+		"这是重要发现.",
+		"这是关键发现.",
+		"this is an important finding.",
+		"this is a key finding.",
+	} {
+		if idx := strings.LastIndex(normalized, marker); idx >= 0 {
+			tail := normalized[idx+len(marker):]
+			if startsWithClaudeProgressAction(tail) || startsWithEnglishProgressAction(tail) {
+				return "finding_then_action", true
+			}
+		}
+	}
+
+	lastClause := normalized
+	if idx := strings.LastIndex(strings.TrimSuffix(normalized, "."), "."); idx >= 0 {
+		lastClause = strings.TrimSpace(strings.TrimSuffix(normalized, ".")[idx+1:])
+	}
+	for _, prefix := range []string{"接下来", "下一步", "现在我会", "现在我将", "我接下来会", "我下一步会"} {
+		if strings.HasPrefix(lastClause, prefix) && startsWithClaudeProgressAction(strings.TrimPrefix(lastClause, prefix)) {
+			return "explicit_next_action", true
+		}
+	}
+	for _, prefix := range []string{"next, ", "next ", "now "} {
+		if strings.HasPrefix(lastClause, prefix) && startsWithEnglishProgressAction(strings.TrimPrefix(lastClause, prefix)) {
+			return "explicit_next_action", true
+		}
+	}
+	if startsWithEnglishProgressAction(lastClause) &&
+		(strings.HasPrefix(lastClause, "i'll now ") || strings.HasPrefix(lastClause, "i will now ") || strings.HasPrefix(lastClause, "let me ")) {
+		return "explicit_next_action", true
+	}
+
+	return "", false
+}
+
+func shouldRejectClaudeProgressOnly(payload *KiroPayload, outputContent string, toolUses []KiroToolUse) (string, bool) {
+	if payload == nil || len(toolUses) > 0 {
+		return "", false
+	}
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) == 0 {
+		return "", false
+	}
+	return matchClaudeProgressOnlyResponse(outputContent)
 }
 
 // RequestLog stores details about a single API request (success or failure).
@@ -1356,6 +1458,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			thinkingOutput = ""
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+
+		if rule, reject := shouldRejectClaudeProgressOnly(payload, outputContent, toolUses); reject {
+			logger.Warnf("[ClaudeProgressGuard] message_id=%s model=%q rule=%q assistant_bytes=%d tool_uses=%d emitted=%t",
+				msgID, model, rule, len([]byte(outputContent)), len(toolUses), messageStarted)
+			h.recordFailureWithDetails("claude", model, account.ID, errClaudeProgressOnlyResponse)
+			stopHeartbeat("progress_guard")
+			ensureMessageStart()
+			stream.send("error", map[string]interface{}{
+				"type":  "error",
+				"error": map[string]string{"type": "api_error", "message": errClaudeProgressOnlyResponse.Error()},
+			})
+			return
+		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

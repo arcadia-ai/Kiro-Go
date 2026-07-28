@@ -59,6 +59,78 @@ func TestClaudeSSEHeartbeatStopsBeforeTerminalEvent(t *testing.T) {
 	}
 }
 
+func TestShouldRejectClaudeProgressOnly(t *testing.T) {
+	const progressText = "网关告警是无限流裸调用,这是重要发现。查看 chain-branches 的调用链和缓存现状。"
+
+	toolPayload := &KiroPayload{}
+	toolPayload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
+		Tools: []KiroToolWrapper{{}},
+	}
+	noToolPayload := &KiroPayload{}
+
+	tests := []struct {
+		name     string
+		payload  *KiroPayload
+		text     string
+		toolUses []KiroToolUse
+		want     bool
+	}{
+		{
+			name:    "exact Chinese progress reproduction",
+			payload: toolPayload,
+			text:    progressText,
+			want:    true,
+		},
+		{
+			name:    "normal short final answer",
+			payload: toolPayload,
+			text:    "已核对 chain-branches 的调用链和缓存，未发现重复注册。",
+			want:    false,
+		},
+		{
+			name:    "completed tool use",
+			payload: toolPayload,
+			text:    progressText,
+			toolUses: []KiroToolUse{{
+				ToolUseID: "tool_1",
+				Name:      "Read",
+				Input:     map[string]interface{}{"path": "chain-branches"},
+			}},
+			want: false,
+		},
+		{
+			name:    "request without client tools",
+			payload: noToolPayload,
+			text:    progressText,
+			want:    false,
+		},
+		{
+			name:    "normal let me know closing",
+			payload: toolPayload,
+			text:    "The change is complete. Let me know if you need another check.",
+			want:    false,
+		},
+		{
+			name:    "explicit English next action",
+			payload: toolPayload,
+			text:    "I found the duplicate registration. I'll now inspect the cache.",
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rule, got := shouldRejectClaudeProgressOnly(tt.payload, tt.text, tt.toolUses)
+			if got != tt.want {
+				t.Fatalf("shouldRejectClaudeProgressOnly() = (%q, %t), want reject=%t", rule, got, tt.want)
+			}
+			if got && rule == "" {
+				t.Fatal("expected a named progress guard rule")
+			}
+		})
+	}
+}
+
 func TestClaudeSSEStreamSerializesConcurrentEvents(t *testing.T) {
 	rec := httptest.NewRecorder()
 	stream := newClaudeSSEStream(rec, rec)
@@ -281,6 +353,83 @@ func TestClaudeStreamRetriesThinkingOnlyBeforeSendingSSE(t *testing.T) {
 	}
 	if !strings.Contains(body, `"stop_reason":"end_turn"`) || !strings.Contains(body, "event: message_stop") {
 		t.Fatalf("recovered response must complete normally, body=%s", body)
+	}
+}
+
+func TestClaudeStreamProgressGuardEmitsErrorWithoutTerminalEvents(t *testing.T) {
+	const progressText = "网关告警是无限流裸调用,这是重要发现。查看 chain-branches 的调用链和缓存现状。"
+
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "progress-only",
+		Enabled:     true,
+		AccessToken: "token-progress-only",
+		ProfileArn:  "arn:aws:codewhisperer:profile/progress-only",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": progressText,
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "继续完成排查",
+		ModelID: "claude-opus-5",
+		Origin:  "AI_EDITOR",
+		UserInputMessageContext: &UserInputMessageContext{
+			Tools: []KiroToolWrapper{{}},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeStream(rec, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+
+	body := rec.Body.String()
+	if calls != 1 {
+		t.Fatalf("progress guard must not replay emitted text internally, got %d upstream calls", calls)
+	}
+	if !strings.Contains(body, progressText) {
+		t.Fatalf("expected already-emitted progress text to remain in the stream, body=%s", body)
+	}
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, `"type":"api_error"`) {
+		t.Fatalf("expected Anthropic SSE api_error, body=%s", body)
+	}
+	if strings.Contains(body, "event: message_delta") || strings.Contains(body, "event: message_stop") {
+		t.Fatalf("progress-only response must not emit successful terminal events, body=%s", body)
+	}
+	if len(h.requestLogs) != 1 || h.requestLogs[0].Status != "error" || h.requestLogs[0].Error != errClaudeProgressOnlyResponse.Error() {
+		t.Fatalf("expected one progress-guard failure log, got %#v", h.requestLogs)
 	}
 }
 
