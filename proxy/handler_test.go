@@ -8,18 +8,26 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestSSEHeartbeatWritesCommentAndFlushes(t *testing.T) {
+func TestClaudeSSEHeartbeatWritesStandardPingAndFlushes(t *testing.T) {
 	rec := httptest.NewRecorder()
-	heartbeat := newSSEHeartbeat(rec, rec, 0)
+	stream := newClaudeSSEStream(rec, rec)
+	heartbeat := startClaudeSSEHeartbeat(stream, 5*time.Millisecond)
 
-	if !heartbeat() {
-		t.Fatalf("expected heartbeat to be written")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for heartbeat.Count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if got := rec.Body.String(); got != ": keep-alive\n\n" {
+	count := heartbeat.Stop()
+	if count == 0 {
+		t.Fatalf("expected heartbeat to be written independently of upstream progress")
+	}
+	want := strings.Repeat("event: ping\ndata: {\"type\":\"ping\"}\n\n", int(count))
+	if got := rec.Body.String(); got != want {
 		t.Fatalf("unexpected heartbeat body %q", got)
 	}
 	if !rec.Flushed {
@@ -27,15 +35,56 @@ func TestSSEHeartbeatWritesCommentAndFlushes(t *testing.T) {
 	}
 }
 
-func TestSSEHeartbeatRespectsInterval(t *testing.T) {
+func TestClaudeSSEHeartbeatStopsBeforeTerminalEvent(t *testing.T) {
 	rec := httptest.NewRecorder()
-	heartbeat := newSSEHeartbeat(rec, rec, time.Hour)
+	stream := newClaudeSSEStream(rec, rec)
+	heartbeat := startClaudeSSEHeartbeat(stream, 5*time.Millisecond)
 
-	if heartbeat() {
-		t.Fatalf("heartbeat should not be sent before the interval elapses")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for heartbeat.Count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if rec.Body.Len() != 0 || rec.Flushed {
-		t.Fatalf("throttled heartbeat must not touch the response")
+	if count := heartbeat.Stop(); count == 0 {
+		t.Fatalf("expected at least one heartbeat before stopping")
+	}
+	stream.send("message_stop", map[string]string{"type": "message_stop"})
+	bodyAfterStop := rec.Body.String()
+	time.Sleep(15 * time.Millisecond)
+
+	if got := rec.Body.String(); got != bodyAfterStop {
+		t.Fatalf("heartbeat wrote after it was stopped: before=%q after=%q", bodyAfterStop, got)
+	}
+	if !strings.HasSuffix(bodyAfterStop, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") {
+		t.Fatalf("expected message_stop to remain the terminal event, got %q", bodyAfterStop)
+	}
+}
+
+func TestClaudeSSEStreamSerializesConcurrentEvents(t *testing.T) {
+	rec := httptest.NewRecorder()
+	stream := newClaudeSSEStream(rec, rec)
+
+	const eventCount = 100
+	var wg sync.WaitGroup
+	for i := 0; i < eventCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !stream.send("ping", map[string]string{"type": "ping"}) {
+				t.Errorf("expected concurrent SSE write to succeed")
+			}
+		}()
+	}
+	wg.Wait()
+
+	wantEvent := "event: ping\ndata: {\"type\":\"ping\"}"
+	events := strings.Split(strings.TrimSpace(rec.Body.String()), "\n\n")
+	if len(events) != eventCount {
+		t.Fatalf("expected %d complete events, got %d", eventCount, len(events))
+	}
+	for i, event := range events {
+		if event != wantEvent {
+			t.Fatalf("event %d was interleaved or malformed: %q", i, event)
+		}
 	}
 }
 

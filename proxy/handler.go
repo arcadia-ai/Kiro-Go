@@ -924,15 +924,27 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
-	streamTouched := false
 	var messageStartUsage promptCacheUsage
-	maybeHeartbeat := newSSEHeartbeat(w, flusher, claudeSSEHeartbeatInterval)
+	stream := newClaudeSSEStream(w, flusher)
+	heartbeat := startClaudeSSEHeartbeat(stream, claudeSSEHeartbeatInterval)
+	var heartbeatCount int64
+	var heartbeatStopOnce sync.Once
+	stopHeartbeat := func(result string) int64 {
+		heartbeatStopOnce.Do(func() {
+			heartbeatCount = heartbeat.Stop()
+			if heartbeatCount > 0 {
+				logger.Infof("[ClaudeHeartbeat] message_id=%s model=%q result=%s heartbeats=%d", msgID, model, result, heartbeatCount)
+			}
+		})
+		return heartbeatCount
+	}
+	defer stopHeartbeat("handler_exit")
 
 	ensureMessageStart := func() {
 		if messageStarted {
 			return
 		}
-		h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+		stream.send("message_start", map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{
 				"id":            msgID,
@@ -976,7 +988,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if activeBlockIndex < 0 {
 				return
 			}
-			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			stream.send("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": activeBlockIndex,
 			})
@@ -995,7 +1007,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			nextContentIndex++
 
 			if blockType == "thinking" {
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				stream.send("content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
@@ -1004,7 +1016,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 			} else {
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				stream.send("content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]string{
@@ -1031,7 +1043,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				stream.send("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1058,7 +1070,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				stream.send("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": outputText},
@@ -1068,7 +1080,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					return
 				}
 				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				stream.send("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": activeBlockIndex,
 					"delta": map[string]string{"type": "text_delta", "text": text},
@@ -1095,7 +1107,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				if text != "" {
 					startContentBlock("thinking")
-					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					stream.send("content_block_delta", map[string]interface{}{
 						"type":  "content_block_delta",
 						"index": activeBlockIndex,
 						"delta": map[string]string{"type": "thinking_delta", "thinking": text},
@@ -1214,11 +1226,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		callback := &KiroStreamCallback{
-			OnProgress: func() {
-				if maybeHeartbeat() {
-					streamTouched = true
-				}
-			},
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -1244,7 +1251,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				idx := nextContentIndex
 				nextContentIndex++
 
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				stream.send("content_block_start", map[string]interface{}{
 					"type":  "content_block_start",
 					"index": idx,
 					"content_block": map[string]interface{}{
@@ -1256,7 +1263,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				})
 
 				inputJSON, _ := json.Marshal(tu.Input)
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				stream.send("content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
 					"index": idx,
 					"delta": map[string]interface{}{
@@ -1265,7 +1272,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 					},
 				})
 
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				stream.send("content_block_stop", map[string]interface{}{
 					"type":  "content_block_stop",
 					"index": idx,
 				})
@@ -1291,7 +1298,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
-			h.sendSSE(w, flusher, "error", map[string]interface{}{
+			stopHeartbeat("stream_error")
+			stream.send("error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
 			})
@@ -1330,8 +1338,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			stopReason = "tool_use"
 		}
 
+		// Stop the asynchronous ping loop before the terminal SSE events so a
+		// heartbeat can never appear after message_stop.
+		stopHeartbeat("complete")
 		ensureMessageStart()
-		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+		stream.send("message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
@@ -1339,15 +1350,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
 		})
 
-		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+		stream.send("message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
 		return
 	}
 
 	if lastErr == nil {
-		if streamTouched {
-			h.sendSSE(w, flusher, "error", map[string]interface{}{
+		if stopHeartbeat("no_accounts") > 0 {
+			stream.send("error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": "No available accounts"},
 			})
@@ -1358,8 +1369,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
-	if streamTouched {
-		h.sendSSE(w, flusher, "error", map[string]interface{}{
+	if stopHeartbeat("request_error") > 0 {
+		stream.send("error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": lastErr.Error()},
 		})
@@ -1368,20 +1379,82 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
-func newSSEHeartbeat(w io.Writer, flusher http.Flusher, interval time.Duration) func() bool {
-	lastSent := time.Now()
-	return func() bool {
-		now := time.Now()
-		if interval > 0 && now.Sub(lastSent) < interval {
-			return false
-		}
-		lastSent = now
-		if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
-			return false
-		}
-		flusher.Flush()
-		return true
+type claudeSSEStream struct {
+	mu       sync.Mutex
+	w        io.Writer
+	flusher  http.Flusher
+	writeErr error
+}
+
+func newClaudeSSEStream(w io.Writer, flusher http.Flusher) *claudeSSEStream {
+	return &claudeSSEStream{w: w, flusher: flusher}
+}
+
+func (s *claudeSSEStream) send(event string, data interface{}) bool {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return false
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writeErr != nil {
+		return false
+	}
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, jsonData); err != nil {
+		s.writeErr = err
+		return false
+	}
+	s.flusher.Flush()
+	return true
+}
+
+type claudeSSEHeartbeat struct {
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	count    atomic.Int64
+}
+
+func startClaudeSSEHeartbeat(stream *claudeSSEStream, interval time.Duration) *claudeSSEHeartbeat {
+	heartbeat := &claudeSSEHeartbeat{
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	if interval <= 0 {
+		close(heartbeat.doneCh)
+		return heartbeat
+	}
+
+	go func() {
+		defer close(heartbeat.doneCh)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !stream.send("ping", map[string]string{"type": "ping"}) {
+					return
+				}
+				heartbeat.count.Add(1)
+			case <-heartbeat.stopCh:
+				return
+			}
+		}
+	}()
+	return heartbeat
+}
+
+func (h *claudeSSEHeartbeat) Stop() int64 {
+	h.stopOnce.Do(func() {
+		close(h.stopCh)
+	})
+	<-h.doneCh
+	return h.count.Load()
+}
+
+func (h *claudeSSEHeartbeat) Count() int64 {
+	return h.count.Load()
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
