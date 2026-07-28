@@ -2141,6 +2141,11 @@ func extractThinkingFromContent(content string) (string, string) {
 		}
 		end := strings.Index(result[start:], "</thinking>")
 		if end == -1 {
+			// A clean EOF can still leave the final thinking tag unclosed. Keep
+			// its prefix as visible text, but never promote the reasoning tail to
+			// a final answer.
+			reasoning += result[start+len("<thinking>"):]
+			result = result[:start]
 			break
 		}
 		end += start

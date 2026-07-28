@@ -64,6 +64,8 @@ func TestParseEventStreamReasoningRepeatedContentIsNotDropped(t *testing.T) {
 		stream.Write(awsEventStreamFrame(t, "reasoningContentEvent",
 			map[string]interface{}{"text": c}))
 	}
+	stream.Write(awsEventStreamFrame(t, "assistantResponseEvent",
+		map[string]interface{}{"content": "done"}))
 
 	var got string
 	err := parseEventStream(bytes.NewReader(stream.Bytes()), &KiroStreamCallback{
@@ -434,6 +436,163 @@ func TestParseEventStreamTrackedThinkingCountsAsEmission(t *testing.T) {
 	}
 	if !emitted {
 		t.Fatalf("thinking text is client-visible, so it must count as emitted")
+	}
+}
+
+func TestParseEventStreamTrackedRejectsReasoningOnlyCleanEOF(t *testing.T) {
+	frame := awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+		"text": "let me think",
+	})
+
+	var completed int
+	emitted, err := parseEventStreamTracked(bytes.NewReader(frame), &KiroStreamCallback{
+		OnText:     func(string, bool) {},
+		OnComplete: func(int, int) { completed++ },
+	})
+	if !errors.Is(err, errIncompleteKiroResponse) {
+		t.Fatalf("expected incomplete response error, got %v", err)
+	}
+	if !emitted {
+		t.Fatal("thinking delivered to the client must count as emitted")
+	}
+	if completed != 0 {
+		t.Fatalf("incomplete response must not complete, got %d callbacks", completed)
+	}
+}
+
+func TestParseEventStreamTrackedRejectsThinkingTagOnlyCleanEOF(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "closed", content: "<thinking>plan the next tool</thinking>"},
+		{name: "unclosed", content: "<thinking>plan the next tool"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+				"content": tc.content,
+			})
+			var completed int
+			_, err := parseEventStreamTracked(bytes.NewReader(frame), &KiroStreamCallback{
+				OnText:     func(string, bool) {},
+				OnComplete: func(int, int) { completed++ },
+			})
+			if !errors.Is(err, errIncompleteKiroResponse) {
+				t.Fatalf("expected incomplete response error, got %v", err)
+			}
+			if completed != 0 {
+				t.Fatalf("incomplete response must not complete, got %d callbacks", completed)
+			}
+		})
+	}
+}
+
+func TestParseEventStreamTrackedAcceptsReasoningWithFinalText(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "thinking"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "done"}),
+	}, nil))
+
+	var completed int
+	_, err := parseEventStreamTracked(stream, &KiroStreamCallback{
+		OnText:     func(string, bool) {},
+		OnComplete: func(int, int) { completed++ },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if completed != 1 {
+		t.Fatalf("expected one completion callback, got %d", completed)
+	}
+}
+
+func TestParseEventStreamTrackedAcceptsReasoningWithToolUse(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "thinking"}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_1",
+			"name":      "lookup",
+			"input":     `{"query":"kiro"}`,
+			"stop":      true,
+		}),
+	}, nil))
+
+	var toolUses, completed int
+	_, err := parseEventStreamTracked(stream, &KiroStreamCallback{
+		OnText:     func(string, bool) {},
+		OnToolUse:  func(KiroToolUse) { toolUses++ },
+		OnComplete: func(int, int) { completed++ },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if toolUses != 1 || completed != 1 {
+		t.Fatalf("toolUses=%d completed=%d, want one each", toolUses, completed)
+	}
+}
+
+func TestCallKiroAPIDoesNotRetryReasoningAlreadyDelivered(t *testing.T) {
+	var calls, waits, completed int
+	installKiroStreamTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		frame := awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "thinking",
+		})
+		return kiroStreamTestResponse(bytes.NewReader(frame)), nil
+	}))
+	installKiroRetryWait(t, func(time.Duration) { waits++ })
+
+	err := CallKiroAPI(
+		newKiroRetryTestAPIKeyAccount(""),
+		newKiroRetryTestPayload(),
+		&KiroStreamCallback{
+			OnText:     func(string, bool) {},
+			OnComplete: func(int, int) { completed++ },
+		},
+	)
+	if !errors.Is(err, errIncompleteKiroResponse) {
+		t.Fatalf("expected incomplete response error, got %v", err)
+	}
+	if calls != 1 || waits != 0 {
+		t.Fatalf("calls=%d waits=%d, want no retry after delivered thinking", calls, waits)
+	}
+	if completed != 0 {
+		t.Fatalf("incomplete response must not complete, got %d callbacks", completed)
+	}
+}
+
+func TestCallKiroAPIRetriesReasoningOnlyWithoutOutputCallback(t *testing.T) {
+	var calls, waits, completed int
+	installKiroStreamTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			frame := awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+				"text": "thinking",
+			})
+			return kiroStreamTestResponse(bytes.NewReader(frame)), nil
+		}
+		frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "recovered",
+		})
+		return kiroStreamTestResponse(bytes.NewReader(frame)), nil
+	}))
+	installKiroRetryWait(t, func(time.Duration) { waits++ })
+
+	err := CallKiroAPI(
+		newKiroRetryTestAPIKeyAccount(""),
+		newKiroRetryTestPayload(),
+		&KiroStreamCallback{OnComplete: func(int, int) { completed++ }},
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 || waits != 1 {
+		t.Fatalf("calls=%d waits=%d, want one safe retry", calls, waits)
+	}
+	if completed != 1 {
+		t.Fatalf("expected recovered stream to complete once, got %d", completed)
 	}
 }
 

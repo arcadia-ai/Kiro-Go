@@ -38,6 +38,7 @@ const (
 
 var (
 	errEmptyKiroStream         = errors.New("upstream stream ended before any output")
+	errIncompleteKiroResponse  = errors.New("upstream stream ended without final assistant text or tool use")
 	errIncompleteKiroToolInput = errors.New("upstream stream ended with incomplete tool input")
 	streamRetryWait            = time.Sleep
 	resolveKiroEndpoints       = endpointsForAccount
@@ -497,7 +498,7 @@ endpointLoop:
 				break endpointLoop
 			}
 
-			logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output (attempt %d/%d): %v",
+			logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output callback (attempt %d/%d): %v",
 				ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, err)
 			streamRetryWait(streamRetryBackoff)
 			if !hasSameEndpointRetry {
@@ -548,11 +549,15 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var sawOutput bool
+	var sawReasoning bool
+	var sawToolUse bool
+	var assistantContent strings.Builder
 	var currentToolUse *toolUseState
 	trackedCallback := *callback
 	originalOnToolUse := trackedCallback.OnToolUse
 	trackedCallback.OnToolUse = func(toolUse KiroToolUse) {
 		sawOutput = true
+		sawToolUse = true
 		if originalOnToolUse != nil {
 			emitted = true
 			originalOnToolUse(toolUse)
@@ -622,6 +627,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				sawOutput = true
+				assistantContent.WriteString(content)
 				if callback.OnText != nil {
 					emitted = true
 					callback.OnText(content, false)
@@ -630,6 +636,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
 				sawOutput = true
+				sawReasoning = true
 				if callback.OnText != nil {
 					emitted = true
 					callback.OnText(text, true)
@@ -660,6 +667,13 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 
 	if !sawOutput {
 		return emitted, errEmptyKiroStream
+	}
+
+	finalContent, embeddedReasoning := extractThinkingFromContent(assistantContent.String())
+	hasFinalAssistantText := strings.TrimSpace(finalContent) != ""
+	hasReasoning := sawReasoning || embeddedReasoning != ""
+	if !hasFinalAssistantText && !sawToolUse && (hasReasoning || assistantContent.Len() > 0) {
+		return emitted, errIncompleteKiroResponse
 	}
 
 	if callback.OnCredits != nil && totalCredits > 0 {

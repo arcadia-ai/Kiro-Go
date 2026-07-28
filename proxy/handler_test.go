@@ -123,6 +123,75 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 }
 
+func TestClaudeStreamReturnsErrorForThinkingOnlyResponse(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "thinking-only",
+		Enabled:     true,
+		AccessToken: "token-thinking-only",
+		ProfileArn:  "arn:aws:codewhisperer:profile/thinking-only",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "I should call a tool next",
+		}))
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	defer kiroHttpStore.Store(oldClient)
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "continue the task",
+		ModelID: "claude-opus-4.7",
+		Origin:  "AI_EDITOR",
+	}
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeStream(rec, payload, "claude-opus-4.7", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
+
+	body := rec.Body.String()
+	if calls != 1 {
+		t.Fatalf("expected no internal retry after thinking was emitted, got %d calls", calls)
+	}
+	if !strings.Contains(body, "event: error") || !strings.Contains(body, errIncompleteKiroResponse.Error()) {
+		t.Fatalf("expected retryable SSE error, body=%s", body)
+	}
+	if strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("thinking-only response must not end successfully, body=%s", body)
+	}
+	if strings.Contains(body, "event: message_stop") {
+		t.Fatalf("thinking-only response must not emit message_stop, body=%s", body)
+	}
+}
+
 func TestThinkingSourceTagFirst(t *testing.T) {
 	var source thinkingStreamSource
 

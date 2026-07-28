@@ -284,6 +284,44 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	}
 }
 
+func TestExtractThinkingFromContentHandlesMultipleAndUnclosedBlocks(t *testing.T) {
+	tests := []struct {
+		name          string
+		content       string
+		wantVisible   string
+		wantReasoning string
+	}{
+		{
+			name:          "closed block with visible text",
+			content:       "before<thinking>one</thinking>after",
+			wantVisible:   "beforeafter",
+			wantReasoning: "one",
+		},
+		{
+			name:          "multiple blocks",
+			content:       "a<thinking>one</thinking>b<thinking>two</thinking>c",
+			wantVisible:   "abc",
+			wantReasoning: "onetwo",
+		},
+		{
+			name:          "unclosed final block",
+			content:       "visible<thinking>unfinished",
+			wantVisible:   "visible",
+			wantReasoning: "unfinished",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			visible, reasoning := extractThinkingFromContent(tc.content)
+			if visible != tc.wantVisible || reasoning != tc.wantReasoning {
+				t.Fatalf("visible=%q reasoning=%q, want %q and %q",
+					visible, reasoning, tc.wantVisible, tc.wantReasoning)
+			}
+		})
+	}
+}
+
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
