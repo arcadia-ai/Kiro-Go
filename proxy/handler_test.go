@@ -12,6 +12,33 @@ import (
 	"time"
 )
 
+func TestSSEHeartbeatWritesCommentAndFlushes(t *testing.T) {
+	rec := httptest.NewRecorder()
+	heartbeat := newSSEHeartbeat(rec, rec, 0)
+
+	if !heartbeat() {
+		t.Fatalf("expected heartbeat to be written")
+	}
+	if got := rec.Body.String(); got != ": keep-alive\n\n" {
+		t.Fatalf("unexpected heartbeat body %q", got)
+	}
+	if !rec.Flushed {
+		t.Fatalf("expected heartbeat to flush the response")
+	}
+}
+
+func TestSSEHeartbeatRespectsInterval(t *testing.T) {
+	rec := httptest.NewRecorder()
+	heartbeat := newSSEHeartbeat(rec, rec, time.Hour)
+
+	if heartbeat() {
+		t.Fatalf("heartbeat should not be sent before the interval elapses")
+	}
+	if rec.Body.Len() != 0 || rec.Flushed {
+		t.Fatalf("throttled heartbeat must not touch the response")
+	}
+}
+
 func TestThinkingSourceReasoningFirst(t *testing.T) {
 	var source thinkingStreamSource
 

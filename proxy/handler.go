@@ -20,6 +20,7 @@ import (
 )
 
 const tokenRefreshSkewSeconds int64 = 120
+const claudeSSEHeartbeatInterval = 15 * time.Second
 
 const (
 	microsoftProfileSelectionTTL          = 10 * time.Minute
@@ -906,6 +907,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -922,7 +924,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	excluded := make(map[string]bool)
 	var lastErr error
 	messageStarted := false
+	streamTouched := false
 	var messageStartUsage promptCacheUsage
+	maybeHeartbeat := newSSEHeartbeat(w, flusher, claudeSSEHeartbeatInterval)
 
 	ensureMessageStart := func() {
 		if messageStarted {
@@ -1210,6 +1214,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		callback := &KiroStreamCallback{
+			OnProgress: func() {
+				if maybeHeartbeat() {
+					streamTouched = true
+				}
+			},
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -1337,12 +1346,42 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	if lastErr == nil {
+		if streamTouched {
+			h.sendSSE(w, flusher, "error", map[string]interface{}{
+				"type":  "error",
+				"error": map[string]string{"type": "api_error", "message": "No available accounts"},
+			})
+			return
+		}
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
+	if streamTouched {
+		h.sendSSE(w, flusher, "error", map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": lastErr.Error()},
+		})
+		return
+	}
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+}
+
+func newSSEHeartbeat(w io.Writer, flusher http.Flusher, interval time.Duration) func() bool {
+	lastSent := time.Now()
+	return func() bool {
+		now := time.Now()
+		if interval > 0 && now.Sub(lastSent) < interval {
+			return false
+		}
+		lastSent = now
+		if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {

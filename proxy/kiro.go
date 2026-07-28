@@ -267,6 +267,7 @@ type InferenceConfig struct {
 type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
+	OnProgress     func()
 	OnComplete     func(inputTokens, outputTokens int)
 	OnError        func(err error)
 	OnCredits      func(credits float64)
@@ -769,6 +770,9 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 		eventType := extractEventType(msgBuf[0:headersLength])
 		diagnostics.FrameCount++
 		diagnostics.LastEventType = eventType
+		if callback.OnProgress != nil {
+			callback.OnProgress()
+		}
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 		if len(payloadBytes) == 0 {
 			continue

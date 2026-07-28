@@ -42,6 +42,12 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+const toolExecutionContinuityPrompt = `<tool_execution_continuity>
+When tools are available and the user asks you to perform work, continue using them until the requested task is complete or you are genuinely blocked and need user input.
+Do not end a turn with a progress update, plan, or statement of the next action. Perform that action with the available tools in the same turn instead.
+Return a final text-only response only after completing the task, or when you must ask the user a specific blocking question.
+</tool_execution_continuity>`
+
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -205,8 +211,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
-	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	// Only inject tool-loop guidance when Kiro will receive client tools.
+	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, len(kiroTools) > 0)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -302,9 +309,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		finalContent = minimalFallbackUserContent
 	}
 
-	// 转换工具
-	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
-
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
@@ -349,16 +353,20 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}, thinking, toolCapable bool) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
-		return systemPrompt
+	parts := make([]string, 0, 3)
+	if thinking {
+		parts = append(parts, ThinkingModePrompt)
 	}
-	if systemPrompt == "" {
-		return ThinkingModePrompt
+	if systemPrompt != "" {
+		parts = append(parts, systemPrompt)
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	if toolCapable {
+		parts = append(parts, toolExecutionContinuityPrompt)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.

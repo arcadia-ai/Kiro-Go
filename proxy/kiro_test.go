@@ -461,6 +461,27 @@ func TestParseEventStreamDiagnosticsReportsCleanMetadataTail(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamProgressDoesNotCountAsOutput(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 0.25}),
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 12.5}),
+	}, nil))
+
+	progressEvents := 0
+	emitted, err := parseEventStreamTracked(stream, &KiroStreamCallback{
+		OnProgress: func() { progressEvents++ },
+	})
+	if !errors.Is(err, errEmptyKiroStream) {
+		t.Fatalf("expected empty stream error, got %v", err)
+	}
+	if emitted {
+		t.Fatalf("progress callbacks must not mark semantic output as emitted")
+	}
+	if progressEvents != 2 {
+		t.Fatalf("expected one progress callback per frame, got %d", progressEvents)
+	}
+}
+
 func TestParseEventStreamDiagnosticsReportsIncompleteToolUse(t *testing.T) {
 	input := `{"query":`
 	frame := awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{

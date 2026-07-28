@@ -231,6 +231,61 @@ func TestClaudeConversationIDStableFromAnchor(t *testing.T) {
 	}
 }
 
+func TestClaudeToKiroAddsToolExecutionContinuityPrompt(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:  "claude-opus-4.6",
+		System: "Follow the project instructions.",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Fix the failing build."},
+		},
+		Tools: []ClaudeTool{{
+			Name:        "read_file",
+			Description: "Read a file",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{"type": "string"},
+				},
+			},
+		}},
+	}
+
+	payload := ClaudeToKiro(req, true)
+	if len(payload.ConversationState.History) < 2 || payload.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatalf("expected system priming pair for tool-capable request")
+	}
+	prompt := payload.ConversationState.History[0].UserInputMessage.Content
+	if !strings.HasPrefix(prompt, ThinkingModePrompt+"\n\n") {
+		t.Fatalf("expected thinking prompt to remain first, got %q", prompt)
+	}
+	if !strings.Contains(prompt, "Follow the project instructions.") {
+		t.Fatalf("expected original system prompt to be preserved, got %q", prompt)
+	}
+	if !strings.Contains(prompt, toolExecutionContinuityPrompt) {
+		t.Fatalf("expected tool execution continuity prompt, got %q", prompt)
+	}
+}
+
+func TestClaudeToKiroOmitsToolExecutionContinuityPromptWithoutClientTools(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:  "claude-opus-4.6",
+		System: "Answer normally.",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Hello."},
+		},
+		Tools: []ClaudeTool{{
+			Type: "web_search_20250305",
+			Name: "web_search",
+		}},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	prompt := payload.ConversationState.History[0].UserInputMessage.Content
+	if strings.Contains(prompt, toolExecutionContinuityPrompt) {
+		t.Fatalf("unexpected tool execution continuity prompt for request without tools")
+	}
+}
+
 func TestOpenAIConversationIDRandomForSyntheticAnchor(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",
