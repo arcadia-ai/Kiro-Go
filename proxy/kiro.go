@@ -273,6 +273,76 @@ type KiroStreamCallback struct {
 	OnContextUsage func(percentage float64)
 }
 
+type bufferedKiroOutput struct {
+	text       string
+	isThinking bool
+	toolUse    *KiroToolUse
+}
+
+type assistantCompletionDetector struct {
+	inThinking bool
+	hasText    bool
+	pending    string
+}
+
+func (d *assistantCompletionDetector) Add(content string) bool {
+	const (
+		openTag  = "<thinking>"
+		closeTag = "</thinking>"
+	)
+
+	if d.hasText {
+		return true
+	}
+	d.pending += content
+
+	for len(d.pending) > 0 {
+		if d.inThinking {
+			end := strings.Index(d.pending, closeTag)
+			if end == -1 {
+				d.pending = tagPrefixSuffix(d.pending, closeTag)
+				return false
+			}
+			d.pending = d.pending[end+len(closeTag):]
+			d.inThinking = false
+			continue
+		}
+
+		start := strings.Index(d.pending, openTag)
+		if start >= 0 {
+			if strings.TrimSpace(d.pending[:start]) != "" {
+				d.hasText = true
+				d.pending = ""
+				return true
+			}
+			d.pending = d.pending[start+len(openTag):]
+			d.inThinking = true
+			continue
+		}
+
+		tagPrefix := tagPrefixSuffix(d.pending, openTag)
+		visibleEnd := len(d.pending) - len(tagPrefix)
+		if strings.TrimSpace(d.pending[:visibleEnd]) != "" {
+			d.hasText = true
+			d.pending = ""
+			return true
+		}
+		d.pending = tagPrefix
+		return false
+	}
+	return false
+}
+
+func tagPrefixSuffix(content, tag string) string {
+	maxLength := min(len(content), len(tag)-1)
+	for length := maxLength; length > 0; length-- {
+		if strings.HasSuffix(content, tag[:length]) {
+			return content[len(content)-length:]
+		}
+	}
+	return ""
+}
+
 // ==================== API Call ====================
 
 func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Account) {
@@ -495,11 +565,20 @@ endpointLoop:
 			hasSameEndpointRetry := streamAttempt < maxStreamAttemptsPerEndpoint
 			hasEndpointFallback := epIndex+1 < len(endpoints)
 			if !hasSameEndpointRetry && !hasEndpointFallback {
+				if errors.Is(err, errIncompleteKiroResponse) {
+					logger.Warnf("[KiroAPI] Endpoint %s reasoning-only response retries exhausted (attempt %d/%d)",
+						ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint)
+				}
 				break endpointLoop
 			}
 
-			logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output callback (attempt %d/%d): %v",
-				ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, err)
+			if errors.Is(err, errIncompleteKiroResponse) {
+				logger.Warnf("[KiroAPI] Endpoint %s returned a reasoning-only response before output; retrying (attempt %d/%d)",
+					ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint)
+			} else {
+				logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output callback (attempt %d/%d): %v",
+					ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, err)
+			}
 			streamRetryWait(streamRetryBackoff)
 			if !hasSameEndpointRetry {
 				continue endpointLoop
@@ -550,20 +629,53 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var contextUsagePercentages []float64
 	var sawOutput bool
 	var sawReasoning bool
+	var sawAssistantContent bool
 	var sawToolUse bool
-	var assistantContent strings.Builder
+	var completionDetector assistantCompletionDetector
 	var currentToolUse *toolUseState
+	var pendingOutputs []bufferedKiroOutput
+	outputsReleased := false
+
+	deliverOutput := func(output bufferedKiroOutput) {
+		if output.toolUse != nil {
+			if callback.OnToolUse != nil {
+				emitted = true
+				callback.OnToolUse(*output.toolUse)
+			}
+			return
+		}
+		if callback.OnText != nil {
+			emitted = true
+			callback.OnText(output.text, output.isThinking)
+		}
+	}
+	releasePendingOutputs := func() {
+		if outputsReleased {
+			return
+		}
+		outputsReleased = true
+		for _, output := range pendingOutputs {
+			deliverOutput(output)
+		}
+		pendingOutputs = nil
+	}
+	queueOutput := func(output bufferedKiroOutput) {
+		if outputsReleased {
+			deliverOutput(output)
+			return
+		}
+		pendingOutputs = append(pendingOutputs, output)
+	}
+
 	trackedCallback := *callback
-	originalOnToolUse := trackedCallback.OnToolUse
 	trackedCallback.OnToolUse = func(toolUse KiroToolUse) {
 		sawOutput = true
 		sawToolUse = true
-		if originalOnToolUse != nil {
-			emitted = true
-			originalOnToolUse(toolUse)
-		}
+		toolUseCopy := toolUse
+		queueOutput(bufferedKiroOutput{toolUse: &toolUseCopy})
+		releasePendingOutputs()
 	}
-	callback = &trackedCallback
+	toolCallback := &trackedCallback
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -610,7 +722,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 
 		// Dispatch by event type.
 		switch eventType {
-		// Both text streams are passed through verbatim. Kiro sends
+		// Both text streams are preserved verbatim. Output is held only until a
+		// final assistant response or complete tool use proves the attempt is usable.
+		// Kiro sends
 		// assistantResponseEvent and reasoningContentEvent as pure incremental deltas
 		// (verified against real upstream traffic), never as cumulative snapshots, and
 		// never replays a chunk: ordering and at-most-once delivery are already
@@ -627,23 +741,20 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				sawOutput = true
-				assistantContent.WriteString(content)
-				if callback.OnText != nil {
-					emitted = true
-					callback.OnText(content, false)
+				sawAssistantContent = true
+				queueOutput(bufferedKiroOutput{text: content})
+				if completionDetector.Add(content) {
+					releasePendingOutputs()
 				}
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
 				sawOutput = true
 				sawReasoning = true
-				if callback.OnText != nil {
-					emitted = true
-					callback.OnText(text, true)
-				}
+				queueOutput(bufferedKiroOutput{text: text, isThinking: true})
 			}
 		case "toolUseEvent":
-			nextToolUse, toolErr := handleToolUseEvent(event, currentToolUse, callback)
+			nextToolUse, toolErr := handleToolUseEvent(event, currentToolUse, toolCallback)
 			if toolErr != nil {
 				return emitted, toolErr
 			}
@@ -660,7 +771,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	}
 
 	if currentToolUse != nil {
-		if err := finishToolUse(currentToolUse, callback); err != nil {
+		if err := finishToolUse(currentToolUse, toolCallback); err != nil {
 			return emitted, err
 		}
 	}
@@ -669,12 +780,11 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		return emitted, errEmptyKiroStream
 	}
 
-	finalContent, embeddedReasoning := extractThinkingFromContent(assistantContent.String())
-	hasFinalAssistantText := strings.TrimSpace(finalContent) != ""
-	hasReasoning := sawReasoning || embeddedReasoning != ""
-	if !hasFinalAssistantText && !sawToolUse && (hasReasoning || assistantContent.Len() > 0) {
+	hasFinalAssistantText := completionDetector.hasText
+	if !hasFinalAssistantText && !sawToolUse && (sawReasoning || sawAssistantContent) {
 		return emitted, errIncompleteKiroResponse
 	}
+	releasePendingOutputs()
 
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)

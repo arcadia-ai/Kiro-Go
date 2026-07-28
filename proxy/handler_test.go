@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -123,7 +124,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 }
 
-func TestClaudeStreamReturnsErrorForThinkingOnlyResponse(t *testing.T) {
+func TestClaudeStreamRetriesThinkingOnlyBeforeSendingSSE(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -147,11 +148,23 @@ func TestClaudeStreamReturnsErrorForThinkingOnlyResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
-			"text": "I should call a tool next",
-		}))
+		if calls == 1 {
+			_, _ = w.Write(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+				"text": "discarded first attempt",
+			}))
+			return
+		}
+		_, _ = w.Write(bytes.Join([][]byte{
+			awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+				"text": "kept second attempt",
+			}),
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+				"content": "recovered response",
+			}),
+		}, nil))
 	}))
 	defer server.Close()
+	installKiroRetryWait(t, func(time.Duration) {})
 
 	oldEndpoints := kiroEndpoints
 	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
@@ -178,17 +191,20 @@ func TestClaudeStreamReturnsErrorForThinkingOnlyResponse(t *testing.T) {
 	h.handleClaudeStream(rec, payload, "claude-opus-4.7", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
 
 	body := rec.Body.String()
-	if calls != 1 {
-		t.Fatalf("expected no internal retry after thinking was emitted, got %d calls", calls)
+	if calls != 2 {
+		t.Fatalf("expected one internal retry before SSE output, got %d calls", calls)
 	}
-	if !strings.Contains(body, "event: error") || !strings.Contains(body, errIncompleteKiroResponse.Error()) {
-		t.Fatalf("expected retryable SSE error, body=%s", body)
+	if strings.Contains(body, "discarded first attempt") {
+		t.Fatalf("first attempt thinking leaked to the client, body=%s", body)
 	}
-	if strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Fatalf("thinking-only response must not end successfully, body=%s", body)
+	if !strings.Contains(body, "kept second attempt") || !strings.Contains(body, "recovered response") {
+		t.Fatalf("recovered attempt was not streamed, body=%s", body)
 	}
-	if strings.Contains(body, "event: message_stop") {
-		t.Fatalf("thinking-only response must not emit message_stop, body=%s", body)
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("transparent retry must not surface an SSE error, body=%s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) || !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("recovered response must complete normally, body=%s", body)
 	}
 }
 
