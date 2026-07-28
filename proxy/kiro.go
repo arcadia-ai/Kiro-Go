@@ -279,6 +279,44 @@ type bufferedKiroOutput struct {
 	toolUse    *KiroToolUse
 }
 
+// kiroStreamDiagnostics captures stream shape without retaining response
+// content. It is logged once per upstream attempt to diagnose silent
+// truncation while keeping prompts, model output, and credentials private.
+type kiroStreamDiagnostics struct {
+	FrameCount         int
+	LastEventType      string
+	AssistantEvents    int
+	AssistantBytes     int
+	ReasoningEvents    int
+	ReasoningBytes     int
+	ToolEvents         int
+	ToolInputBytes     int
+	CompletedToolUses  int
+	MeteringEvents     int
+	ContextUsageEvents int
+	OutputsReleased    bool
+	PendingToolUse     bool
+}
+
+func (d kiroStreamDiagnostics) summary() string {
+	return fmt.Sprintf(
+		"frames=%d last_event=%q assistant_events=%d assistant_bytes=%d reasoning_events=%d reasoning_bytes=%d tool_events=%d tool_input_bytes=%d completed_tools=%d pending_tool=%t metering_events=%d context_usage_events=%d outputs_released=%t",
+		d.FrameCount,
+		d.LastEventType,
+		d.AssistantEvents,
+		d.AssistantBytes,
+		d.ReasoningEvents,
+		d.ReasoningBytes,
+		d.ToolEvents,
+		d.ToolInputBytes,
+		d.CompletedToolUses,
+		d.PendingToolUse,
+		d.MeteringEvents,
+		d.ContextUsageEvents,
+		d.OutputsReleased,
+	)
+}
+
 type assistantCompletionDetector struct {
 	inThinking bool
 	hasText    bool
@@ -545,11 +583,16 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			emitted, err := parseEventStreamTracked(resp.Body, callback)
+			var diagnostics kiroStreamDiagnostics
+			emitted, err := parseEventStreamTrackedWithDiagnostics(resp.Body, callback, &diagnostics)
 			resp.Body.Close()
 			if err == nil {
+				logger.Infof("[KiroStream] endpoint=%q invocation_id=%s attempt=%d/%d result=complete emitted=%t %s",
+					ep.Name, invocationID, streamAttempt, maxStreamAttemptsPerEndpoint, emitted, diagnostics.summary())
 				return nil
 			}
+			logger.Warnf("[KiroStream] endpoint=%q invocation_id=%s attempt=%d/%d result=error emitted=%t error=%q %s",
+				ep.Name, invocationID, streamAttempt, maxStreamAttemptsPerEndpoint, emitted, err.Error(), diagnostics.summary())
 			lastErr = err
 			// "Emitted" deliberately means that an output callback ran. This
 			// conservative boundary also protects buffered/non-stream callers:
@@ -619,8 +662,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 // output callback was invoked. A failure before the first callback is safe to
 // retry because it cannot duplicate or concatenate caller state.
 func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emitted bool, err error) {
+	return parseEventStreamTrackedWithDiagnostics(body, callback, nil)
+}
+
+func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStreamCallback, diagnostics *kiroStreamDiagnostics) (emitted bool, err error) {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
+	}
+	if diagnostics == nil {
+		diagnostics = &kiroStreamDiagnostics{}
+	} else {
+		*diagnostics = kiroStreamDiagnostics{}
 	}
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
@@ -633,8 +685,13 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var sawToolUse bool
 	var completionDetector assistantCompletionDetector
 	var currentToolUse *toolUseState
+	var pendingToolUse bool
 	var pendingOutputs []bufferedKiroOutput
 	outputsReleased := false
+	defer func() {
+		diagnostics.OutputsReleased = outputsReleased
+		diagnostics.PendingToolUse = pendingToolUse
+	}()
 
 	deliverOutput := func(output bufferedKiroOutput) {
 		if output.toolUse != nil {
@@ -671,6 +728,8 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	trackedCallback.OnToolUse = func(toolUse KiroToolUse) {
 		sawOutput = true
 		sawToolUse = true
+		pendingToolUse = false
+		diagnostics.CompletedToolUses++
 		toolUseCopy := toolUse
 		queueOutput(bufferedKiroOutput{toolUse: &toolUseCopy})
 		releasePendingOutputs()
@@ -708,6 +767,8 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		}
 
 		eventType := extractEventType(msgBuf[0:headersLength])
+		diagnostics.FrameCount++
+		diagnostics.LastEventType = eventType
 		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
 		if len(payloadBytes) == 0 {
 			continue
@@ -739,7 +800,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		// implementation turned "6666666666" into "666", "abababab" into "abab" and
 		// "1833" into "183", on both streams.
 		case "assistantResponseEvent":
+			diagnostics.AssistantEvents++
 			if content, ok := event["content"].(string); ok && content != "" {
+				diagnostics.AssistantBytes += len(content)
 				sawOutput = true
 				sawAssistantContent = true
 				queueOutput(bufferedKiroOutput{text: content})
@@ -748,22 +811,36 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 				}
 			}
 		case "reasoningContentEvent":
+			diagnostics.ReasoningEvents++
 			if text, ok := event["text"].(string); ok && text != "" {
+				diagnostics.ReasoningBytes += len(text)
 				sawOutput = true
 				sawReasoning = true
 				queueOutput(bufferedKiroOutput{text: text, isThinking: true})
 			}
 		case "toolUseEvent":
+			diagnostics.ToolEvents++
+			pendingToolUse = true
+			if input, ok := event["input"].(string); ok {
+				diagnostics.ToolInputBytes += len(input)
+			} else if input, ok := event["input"].(map[string]interface{}); ok {
+				if data, marshalErr := json.Marshal(input); marshalErr == nil {
+					diagnostics.ToolInputBytes += len(data)
+				}
+			}
 			nextToolUse, toolErr := handleToolUseEvent(event, currentToolUse, toolCallback)
 			if toolErr != nil {
 				return emitted, toolErr
 			}
 			currentToolUse = nextToolUse
+			pendingToolUse = currentToolUse != nil
 		case "meteringEvent":
+			diagnostics.MeteringEvents++
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
 		case "contextUsageEvent":
+			diagnostics.ContextUsageEvents++
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
 			}
@@ -774,6 +851,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		if err := finishToolUse(currentToolUse, toolCallback); err != nil {
 			return emitted, err
 		}
+		currentToolUse = nil
 	}
 
 	if !sawOutput {

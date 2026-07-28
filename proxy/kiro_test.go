@@ -406,6 +406,85 @@ func TestParseEventStreamTrackedReportsEmissionAfterText(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamDiagnosticsReportsPartialTextFailure(t *testing.T) {
+	frame := awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "partial answer",
+	})
+	stream := &truncatedReader{
+		data: append(frame, 0, 0, 1),
+		err:  io.ErrUnexpectedEOF,
+	}
+
+	var diagnostics kiroStreamDiagnostics
+	emitted, err := parseEventStreamTrackedWithDiagnostics(stream, &KiroStreamCallback{
+		OnText: func(string, bool) {},
+	}, &diagnostics)
+	if !errors.Is(err, io.ErrUnexpectedEOF) || !emitted {
+		t.Fatalf("expected emitted unexpected EOF, emitted=%v err=%v", emitted, err)
+	}
+	if diagnostics.FrameCount != 1 || diagnostics.LastEventType != "assistantResponseEvent" {
+		t.Fatalf("unexpected frame diagnostics: %#v", diagnostics)
+	}
+	if diagnostics.AssistantEvents != 1 || diagnostics.AssistantBytes != len("partial answer") {
+		t.Fatalf("unexpected assistant diagnostics: %#v", diagnostics)
+	}
+	if !diagnostics.OutputsReleased || diagnostics.ContextUsageEvents != 0 {
+		t.Fatalf("unexpected completion diagnostics: %#v", diagnostics)
+	}
+	if strings.Contains(diagnostics.summary(), "partial answer") {
+		t.Fatalf("diagnostic summary must not contain response content: %s", diagnostics.summary())
+	}
+}
+
+func TestParseEventStreamDiagnosticsReportsCleanMetadataTail(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "done"}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 0.25}),
+		awsEventStreamFrame(t, "contextUsageEvent", map[string]interface{}{"contextUsagePercentage": 12.5}),
+	}, nil))
+
+	var diagnostics kiroStreamDiagnostics
+	emitted, err := parseEventStreamTrackedWithDiagnostics(stream, &KiroStreamCallback{
+		OnText: func(string, bool) {},
+	}, &diagnostics)
+	if err != nil || !emitted {
+		t.Fatalf("expected completed emitted stream, emitted=%v err=%v", emitted, err)
+	}
+	if diagnostics.FrameCount != 3 || diagnostics.LastEventType != "contextUsageEvent" {
+		t.Fatalf("unexpected frame diagnostics: %#v", diagnostics)
+	}
+	if diagnostics.MeteringEvents != 1 || diagnostics.ContextUsageEvents != 1 {
+		t.Fatalf("unexpected metadata diagnostics: %#v", diagnostics)
+	}
+	if !diagnostics.OutputsReleased || diagnostics.PendingToolUse {
+		t.Fatalf("unexpected output diagnostics: %#v", diagnostics)
+	}
+}
+
+func TestParseEventStreamDiagnosticsReportsIncompleteToolUse(t *testing.T) {
+	input := `{"query":`
+	frame := awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+		"toolUseId": "toolu_partial",
+		"name":      "lookup",
+		"input":     input,
+		"stop":      true,
+	})
+
+	var diagnostics kiroStreamDiagnostics
+	emitted, err := parseEventStreamTrackedWithDiagnostics(bytes.NewReader(frame), &KiroStreamCallback{
+		OnToolUse: func(KiroToolUse) {},
+	}, &diagnostics)
+	if !errors.Is(err, errIncompleteKiroToolInput) || emitted {
+		t.Fatalf("expected buffered incomplete tool error, emitted=%v err=%v", emitted, err)
+	}
+	if diagnostics.ToolEvents != 1 || diagnostics.ToolInputBytes != len(input) {
+		t.Fatalf("unexpected tool diagnostics: %#v", diagnostics)
+	}
+	if diagnostics.CompletedToolUses != 0 || !diagnostics.PendingToolUse || diagnostics.OutputsReleased {
+		t.Fatalf("unexpected tool completion diagnostics: %#v", diagnostics)
+	}
+}
+
 func TestParseEventStreamTrackedReportsEmissionOnCleanStream(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 		"content": "done",
