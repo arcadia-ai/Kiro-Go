@@ -533,6 +533,13 @@ func TestParseModelAndThinking(t *testing.T) {
 		{"thinking suffix on dot form", "claude-sonnet-4.5-thinking", "claude-sonnet-4.5", true},
 		{"thinking suffix on legacy alias", "claude-3-5-sonnet-thinking", "claude-sonnet-4.5", true},
 
+		// Claude Code's 1M selector is client-only and must not reach Kiro.
+		{"1m suffix", "claude-opus-5[1m]", "claude-opus-5", false},
+		{"uppercase 1m suffix", "claude-opus-5[1M]", "claude-opus-5", false},
+		{"1m before thinking suffix", "claude-opus-5[1m]-thinking", "claude-opus-5", true},
+		{"1m after thinking suffix", "claude-opus-5-thinking[1m]", "claude-opus-5", true},
+		{"repeated 1m suffix", "claude-opus-5[1m][1m]", "claude-opus-5", false},
+
 		// Unknown models pass through unchanged.
 		{"unknown model", "some-other-model", "some-other-model", false},
 		{"misspelled claude family", "claude-opux-4-8", "claude-opux-4-8", false},

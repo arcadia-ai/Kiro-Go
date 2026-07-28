@@ -38,6 +38,8 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
+const extendedContextSuffix = "[1m]"
+
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
@@ -73,16 +75,26 @@ const minRecentHistoryTurns = 4
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
-	lower := strings.ToLower(model)
 	thinking := false
 
-	// Strip the configured thinking suffix (e.g. "-thinking") if present.
-	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
-		thinking = true
-		model = model[:len(model)-len(thinkingSuffix)]
-		lower = strings.ToLower(model)
+	// Client-only selectors must not reach Kiro as part of the model ID. Repeat
+	// so combinations such as "-thinking[1m]" and "[1m]-thinking" both work.
+	for {
+		changed := false
+		if stripped, ok := stripModelSuffix(model, extendedContextSuffix); ok {
+			model = stripped
+			changed = true
+		}
+		if stripped, ok := stripModelSuffix(model, thinkingSuffix); ok {
+			model = stripped
+			thinking = true
+			changed = true
+		}
+		if !changed {
+			break
+		}
 	}
+	lower := strings.ToLower(model)
 
 	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
 	for _, m := range modelAliases {
@@ -103,6 +115,17 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	}
 
 	return model, thinking
+}
+
+func stripModelSuffix(model string, suffix string) (string, bool) {
+	if suffix == "" || len(model) < len(suffix) {
+		return model, false
+	}
+	start := len(model) - len(suffix)
+	if !strings.EqualFold(model[start:], suffix) {
+		return model, false
+	}
+	return model[:start], true
 }
 
 func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {

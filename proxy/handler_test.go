@@ -623,21 +623,49 @@ func TestMergeUniqueModelsPreservesUnionAcrossAccounts(t *testing.T) {
 }
 
 func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
-	models := buildAnthropicModelsResponse([]ModelInfo{{
-		ModelId:    "claude-sonnet-4.5",
-		InputTypes: []string{"text", "image"},
-	}}, "-thinking")
+	var model ModelInfo
+	if err := json.Unmarshal([]byte(`{
+		"modelId":"claude-opus-5",
+		"supportedInputTypes":["text","image"],
+		"tokenLimits":{"maxInputTokens":1000000,"maxOutputTokens":128000}
+	}`), &model); err != nil {
+		t.Fatalf("unmarshal model metadata: %v", err)
+	}
+	models := buildAnthropicModelsResponse([]ModelInfo{model}, "-thinking")
 
 	if len(models) != 2 {
 		t.Fatalf("expected base model and thinking variant, got %d", len(models))
 	}
-	if models[0]["id"] != "claude-sonnet-4.5" {
+	if models[0]["id"] != "claude-opus-5" {
 		t.Fatalf("unexpected base model id: %#v", models[0]["id"])
 	}
-	if models[1]["id"] != "claude-sonnet-4.5-thinking" {
+	if models[1]["id"] != "claude-opus-5-thinking" {
 		t.Fatalf("unexpected thinking model id: %#v", models[1]["id"])
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+	for _, got := range models {
+		if got["max_input_tokens"] != 1_000_000 {
+			t.Fatalf("expected max_input_tokens from Kiro metadata, got %#v", got["max_input_tokens"])
+		}
+		if got["max_tokens"] != 128_000 {
+			t.Fatalf("expected max_tokens from Kiro metadata, got %#v", got["max_tokens"])
+		}
+	}
+}
+
+func TestBuildAnthropicModelsResponseFallsBackToKnownContextWindow(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{{ModelId: "claude-opus-5"}}, "-thinking")
+	if len(models) != 2 {
+		t.Fatalf("expected base model and thinking variant, got %d", len(models))
+	}
+	for _, got := range models {
+		if got["max_input_tokens"] != 1_000_000 {
+			t.Fatalf("expected classified 1M input limit, got %#v", got["max_input_tokens"])
+		}
+		if _, exists := got["max_tokens"]; exists {
+			t.Fatalf("must not invent an unknown output limit, got %#v", got["max_tokens"])
+		}
 	}
 }

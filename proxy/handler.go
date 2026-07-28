@@ -547,9 +547,10 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	if len(cached) > 0 {
 		for _, m := range cached {
 			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
+			maxInputTokens, maxOutputTokens := resolveModelTokenLimits(m)
+			models = append(models, buildModelInfoWithTokenLimits(m.ModelId, "anthropic", supportsImage, maxInputTokens, maxOutputTokens))
 			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+			models = append(models, buildModelInfoWithTokenLimits(m.ModelId+thinkingSuffix, "anthropic", supportsImage, maxInputTokens, maxOutputTokens))
 		}
 	}
 	return models
@@ -557,21 +558,39 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
 	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+		buildFallbackAnthropicModelInfo("claude-sonnet-4.6", true),
+		buildFallbackAnthropicModelInfo("claude-sonnet-4.6"+thinkingSuffix, true),
+		buildFallbackAnthropicModelInfo("claude-opus-4.6", true),
+		buildFallbackAnthropicModelInfo("claude-opus-4.6"+thinkingSuffix, true),
+		buildFallbackAnthropicModelInfo("claude-opus-4.7", true),
+		buildFallbackAnthropicModelInfo("claude-opus-4.7"+thinkingSuffix, true),
+		buildFallbackAnthropicModelInfo("claude-sonnet-4.5", true),
+		buildFallbackAnthropicModelInfo("claude-sonnet-4.5"+thinkingSuffix, true),
+		buildFallbackAnthropicModelInfo("claude-sonnet-4", true),
+		buildFallbackAnthropicModelInfo("claude-sonnet-4"+thinkingSuffix, true),
+		buildFallbackAnthropicModelInfo("claude-haiku-4.5", true),
+		buildFallbackAnthropicModelInfo("claude-haiku-4.5"+thinkingSuffix, true),
+		buildFallbackAnthropicModelInfo("claude-opus-4.5", true),
+		buildFallbackAnthropicModelInfo("claude-opus-4.5"+thinkingSuffix, true),
 	}
+}
+
+func resolveModelTokenLimits(model ModelInfo) (int, int) {
+	maxInputTokens := getContextWindowSize(model.ModelId)
+	maxOutputTokens := 0
+	if model.TokenLimits != nil {
+		if model.TokenLimits.MaxInputTokens > 0 {
+			maxInputTokens = model.TokenLimits.MaxInputTokens
+		}
+		if model.TokenLimits.MaxOutputTokens > 0 {
+			maxOutputTokens = model.TokenLimits.MaxOutputTokens
+		}
+	}
+	return maxInputTokens, maxOutputTokens
+}
+
+func buildFallbackAnthropicModelInfo(id string, supportsImage bool) map[string]interface{} {
+	return buildModelInfoWithTokenLimits(id, "anthropic", supportsImage, getContextWindowSize(id), 0)
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -615,6 +634,17 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 			},
 		},
 	}
+}
+
+func buildModelInfoWithTokenLimits(id, ownedBy string, supportsImage bool, maxInputTokens, maxOutputTokens int) map[string]interface{} {
+	model := buildModelInfo(id, ownedBy, supportsImage)
+	if maxInputTokens > 0 {
+		model["max_input_tokens"] = maxInputTokens
+	}
+	if maxOutputTokens > 0 {
+		model["max_tokens"] = maxOutputTokens
+	}
+	return model
 }
 
 // refreshModelsCache 从 Kiro API 拉取模型列表并缓存
