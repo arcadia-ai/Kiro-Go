@@ -26,7 +26,16 @@ const claudeProgressGuardMaxBytes = 768
 var errClaudeProgressOnlyResponse = errors.New("upstream response ended with a progress update before completing the requested tool work")
 
 var claudeProgressGuardActions = []string{
-	"查看", "检查", "核对", "确认", "分析", "追踪", "继续",
+	"查看", "检查", "核对", "确认", "分析", "追踪", "核实", "排查", "验证", "定位", "处理", "修复",
+}
+
+var claudeProgressGuardEnglishActions = []string{
+	"inspect", "check", "review", "investigate", "trace", "verify", "continue", "read", "search", "run", "open", "look", "analyze", "locate", "handle", "fix",
+}
+
+var claudeProgressGuardCompletionMarkers = []string{
+	"全部完成", "已完成", "已经完成", "处理完毕", "无需继续", "无需处理", "没有剩余", "无剩余",
+	"all work is complete", "work is complete", "task is complete", "no remaining work", "nothing left to do", "no further action",
 }
 
 const (
@@ -67,11 +76,21 @@ func normalizeClaudeProgressGuardText(text string) string {
 
 func startsWithClaudeProgressAction(text string) bool {
 	text = strings.TrimSpace(text)
-	for _, prefix := range []string{"我会", "我将", "我先", "会", "将", "先", "需要"} {
+	for _, prefix := range []string{"我会", "我将", "我先", "会", "将", "先", "需要", "继续", "再"} {
 		text = strings.TrimSpace(strings.TrimPrefix(text, prefix))
 	}
 	for _, action := range claudeProgressGuardActions {
 		if strings.HasPrefix(text, action) {
+			return true
+		}
+	}
+	return false
+}
+
+func startsWithEnglishAction(text string) bool {
+	text = strings.TrimSpace(text)
+	for _, action := range claudeProgressGuardEnglishActions {
+		if text == action || strings.HasPrefix(text, action+" ") {
 			return true
 		}
 	}
@@ -83,11 +102,56 @@ func startsWithEnglishProgressAction(text string) bool {
 	for _, prefix := range []string{"i'll ", "i will ", "let me ", "now "} {
 		text = strings.TrimSpace(strings.TrimPrefix(text, prefix))
 	}
-	for _, action := range []string{"inspect ", "check ", "review ", "investigate ", "trace ", "verify ", "continue ", "read ", "search ", "run ", "open ", "look "} {
-		if strings.HasPrefix(text, action) {
+	return startsWithEnglishAction(text)
+}
+
+func containsClaudeProgressMarker(text string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
 			return true
 		}
 	}
+	return false
+}
+
+func lastClaudeProgressClause(text string) string {
+	text = strings.TrimSpace(strings.TrimRight(text, "."))
+	if idx := strings.LastIndex(text, "."); idx >= 0 {
+		return strings.TrimSpace(text[idx+1:])
+	}
+	return text
+}
+
+func matchesUnfinishedWorkAction(clause string) bool {
+	clause = strings.TrimSpace(clause)
+	if clause == "" {
+		return false
+	}
+
+	for _, action := range claudeProgressGuardActions {
+		if strings.HasPrefix(clause, action) && containsClaudeProgressMarker(clause[len(action):], []string{"剩余", "其余", "余下", "尚未", "未完成"}) {
+			return true
+		}
+	}
+	for _, prefix := range []string{"继续", "再", "还需", "仍需", "尚需", "待"} {
+		if strings.HasPrefix(clause, prefix) && startsWithClaudeProgressAction(strings.TrimPrefix(clause, prefix)) {
+			return true
+		}
+	}
+
+	for _, prefix := range []string{"continue to ", "continue ", "still need to ", "still need ", "yet to "} {
+		if strings.HasPrefix(clause, prefix) && startsWithEnglishAction(strings.TrimPrefix(clause, prefix)) {
+			return true
+		}
+	}
+	if strings.HasPrefix(clause, "remaining ") {
+		for _, action := range claudeProgressGuardEnglishActions {
+			if strings.Contains(clause, " "+action+" ") || strings.HasSuffix(clause, " "+action) {
+				return true
+			}
+		}
+	}
+
 	return false
 }
 
@@ -99,6 +163,10 @@ func matchClaudeProgressOnlyResponse(text string) (string, bool) {
 		return "", false
 	}
 	normalized := normalizeClaudeProgressGuardText(trimmed)
+	lastClause := lastClaudeProgressClause(normalized)
+	if containsClaudeProgressMarker(lastClause, claudeProgressGuardCompletionMarkers) {
+		return "", false
+	}
 
 	for _, marker := range []string{
 		"这是重要发现.",
@@ -114,10 +182,6 @@ func matchClaudeProgressOnlyResponse(text string) (string, bool) {
 		}
 	}
 
-	lastClause := normalized
-	if idx := strings.LastIndex(strings.TrimSuffix(normalized, "."), "."); idx >= 0 {
-		lastClause = strings.TrimSpace(strings.TrimSuffix(normalized, ".")[idx+1:])
-	}
 	for _, prefix := range []string{"接下来", "下一步", "现在我会", "现在我将", "我接下来会", "我下一步会"} {
 		if strings.HasPrefix(lastClause, prefix) && startsWithClaudeProgressAction(strings.TrimPrefix(lastClause, prefix)) {
 			return "explicit_next_action", true
@@ -131,6 +195,9 @@ func matchClaudeProgressOnlyResponse(text string) (string, bool) {
 	if startsWithEnglishProgressAction(lastClause) &&
 		(strings.HasPrefix(lastClause, "i'll now ") || strings.HasPrefix(lastClause, "i will now ") || strings.HasPrefix(lastClause, "let me ")) {
 		return "explicit_next_action", true
+	}
+	if matchesUnfinishedWorkAction(lastClause) {
+		return "unfinished_work_action", true
 	}
 
 	return "", false

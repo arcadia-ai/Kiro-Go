@@ -61,6 +61,7 @@ func TestClaudeSSEHeartbeatStopsBeforeTerminalEvent(t *testing.T) {
 
 func TestShouldRejectClaudeProgressOnly(t *testing.T) {
 	const progressText = "网关告警是无限流裸调用,这是重要发现。查看 chain-branches 的调用链和缓存现状。"
+	const unfinishedText = "1013 条同源：lakala OP90001 商户权限未开通。核实剩余大块的根因，重点是 /init 门涉及的网关。"
 
 	toolPayload := &KiroPayload{}
 	toolPayload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
@@ -74,12 +75,67 @@ func TestShouldRejectClaudeProgressOnly(t *testing.T) {
 		text     string
 		toolUses []KiroToolUse
 		want     bool
+		wantRule string
 	}{
 		{
-			name:    "exact Chinese progress reproduction",
+			name:     "exact Chinese progress reproduction",
+			payload:  toolPayload,
+			text:     progressText,
+			want:     true,
+			wantRule: "finding_then_action",
+		},
+		{
+			name:     "unfinished work action reproduction",
+			payload:  toolPayload,
+			text:     unfinishedText,
+			want:     true,
+			wantRule: "unfinished_work_action",
+		},
+		{
+			name:    "completed remaining work",
 			payload: toolPayload,
-			text:    progressText,
-			want:    true,
+			text:    "已核实剩余大块，问题均已处理完成。",
+			want:    false,
+		},
+		{
+			name:    "completion marker overrides existing rule",
+			payload: toolPayload,
+			text:    "这是重要发现。查看后已完成全部修复。",
+			want:    false,
+		},
+		{
+			name:    "advisory remaining risk final answer",
+			payload: toolPayload,
+			text:    "剩余风险建议后续核实，不影响本次结论。",
+			want:    false,
+		},
+		{
+			name:     "continue action",
+			payload:  toolPayload,
+			text:     "继续排查剩余异常订单。",
+			want:     true,
+			wantRule: "unfinished_work_action",
+		},
+		{
+			name:     "pending action",
+			payload:  toolPayload,
+			text:     "仍需验证 settleTask 的锁定逻辑。",
+			want:     true,
+			wantRule: "unfinished_work_action",
+		},
+		{
+			name:     "English unfinished action",
+			payload:  toolPayload,
+			text:     "Still need to inspect the remaining gateway branches.",
+			want:     true,
+			wantRule: "unfinished_work_action",
+		},
+		{
+			name:     "completed describes work item",
+			payload:  toolPayload,
+			text:     "Still need to inspect completed jobs for duplicate callbacks.",
+			want:     true,
+			wantRule: "unfinished_work_action",
 		},
 		{
 			name:    "normal short final answer",
@@ -90,7 +146,7 @@ func TestShouldRejectClaudeProgressOnly(t *testing.T) {
 		{
 			name:    "completed tool use",
 			payload: toolPayload,
-			text:    progressText,
+			text:    unfinishedText,
 			toolUses: []KiroToolUse{{
 				ToolUseID: "tool_1",
 				Name:      "Read",
@@ -101,7 +157,7 @@ func TestShouldRejectClaudeProgressOnly(t *testing.T) {
 		{
 			name:    "request without client tools",
 			payload: noToolPayload,
-			text:    progressText,
+			text:    unfinishedText,
 			want:    false,
 		},
 		{
@@ -111,10 +167,17 @@ func TestShouldRejectClaudeProgressOnly(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "explicit English next action",
+			name:     "explicit English next action",
+			payload:  toolPayload,
+			text:     "I found the duplicate registration. I'll now inspect the cache.",
+			want:     true,
+			wantRule: "explicit_next_action",
+		},
+		{
+			name:    "response over progress guard limit",
 			payload: toolPayload,
-			text:    "I found the duplicate registration. I'll now inspect the cache.",
-			want:    true,
+			text:    unfinishedText + strings.Repeat("x", claudeProgressGuardMaxBytes),
+			want:    false,
 		},
 	}
 
@@ -126,6 +189,9 @@ func TestShouldRejectClaudeProgressOnly(t *testing.T) {
 			}
 			if got && rule == "" {
 				t.Fatal("expected a named progress guard rule")
+			}
+			if tt.wantRule != "" && rule != tt.wantRule {
+				t.Fatalf("expected rule %q, got %q", tt.wantRule, rule)
 			}
 		})
 	}
@@ -357,7 +423,7 @@ func TestClaudeStreamRetriesThinkingOnlyBeforeSendingSSE(t *testing.T) {
 }
 
 func TestClaudeStreamProgressGuardEmitsErrorWithoutTerminalEvents(t *testing.T) {
-	const progressText = "网关告警是无限流裸调用,这是重要发现。查看 chain-branches 的调用链和缓存现状。"
+	const progressText = "核实剩余大块的根因，重点是 /init 门涉及的网关。"
 
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {
