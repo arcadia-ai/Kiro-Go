@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -34,14 +35,18 @@ const (
 	// covers the observed transient drops without multiplying the existing
 	// endpoint and account fallback budgets more than necessary.
 	maxStreamAttemptsPerEndpoint = 2
+	maxEventStreamMessageSize    = 16 * 1024 * 1024
 )
 
 var (
-	errEmptyKiroStream         = errors.New("upstream stream ended before any output")
-	errIncompleteKiroResponse  = errors.New("upstream stream ended without final assistant text or tool use")
-	errIncompleteKiroToolInput = errors.New("upstream stream ended with incomplete tool input")
-	streamRetryWait            = time.Sleep
-	resolveKiroEndpoints       = endpointsForAccount
+	errEmptyKiroStream           = errors.New("upstream stream ended before any output")
+	errUpstreamTruncatedResponse = errors.New("upstream truncated response without stop reason")
+	errIncompleteKiroResponse    = errUpstreamTruncatedResponse
+	errIncompleteKiroToolInput   = errors.New("upstream stream ended with incomplete tool input")
+	errInvalidKiroEventStream    = errors.New("invalid upstream event stream")
+	errKiroEventStreamUpstream   = errors.New("upstream event stream error")
+	streamRetryWait              = waitForStreamRetry
+	resolveKiroEndpoints         = endpointsForAccount
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
@@ -194,7 +199,9 @@ type KiroPayload struct {
 	// original names supplied by the client. Used to restore original names
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
-	ToolNameMap map[string]string `json:"-"`
+	ToolNameMap            map[string]string `json:"-"`
+	StrictCompletion       bool              `json:"-"`
+	InternalFinishToolName string            `json:"-"`
 }
 
 type KiroUserInputMessage struct {
@@ -272,6 +279,7 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	OnStopReason   func(reason string)
 }
 
 type bufferedKiroOutput struct {
@@ -295,13 +303,16 @@ type kiroStreamDiagnostics struct {
 	CompletedToolUses  int
 	MeteringEvents     int
 	ContextUsageEvents int
+	MetadataEvents     int
+	StopReason         string
+	Integrity          string
 	OutputsReleased    bool
 	PendingToolUse     bool
 }
 
 func (d kiroStreamDiagnostics) summary() string {
 	return fmt.Sprintf(
-		"frames=%d last_event=%q assistant_events=%d assistant_bytes=%d reasoning_events=%d reasoning_bytes=%d tool_events=%d tool_input_bytes=%d completed_tools=%d pending_tool=%t metering_events=%d context_usage_events=%d outputs_released=%t",
+		"frames=%d last_event=%q assistant_events=%d assistant_bytes=%d reasoning_events=%d reasoning_bytes=%d tool_events=%d tool_input_bytes=%d completed_tools=%d pending_tool=%t metering_events=%d context_usage_events=%d metadata_events=%d stop_reason=%q integrity=%q outputs_released=%t",
 		d.FrameCount,
 		d.LastEventType,
 		d.AssistantEvents,
@@ -314,6 +325,9 @@ func (d kiroStreamDiagnostics) summary() string {
 		d.PendingToolUse,
 		d.MeteringEvents,
 		d.ContextUsageEvents,
+		d.MetadataEvents,
+		d.StopReason,
+		d.Integrity,
 		d.OutputsReleased,
 	)
 }
@@ -458,6 +472,18 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIContext(context.Background(), account, payload, callback)
+}
+
+// CallKiroAPIContext calls Kiro while respecting cancellation from the client request.
+func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return callKiroAPIContext(ctx, account, payload, callback, nil)
+}
+
+func callKiroAPIContext(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, beforeAttempt func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -507,6 +533,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	var lastErr error
 endpointLoop:
 	for epIndex, ep := range endpoints {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -526,8 +555,19 @@ endpointLoop:
 		invocationID := uuid.New().String()
 
 		for streamAttempt := 1; streamAttempt <= maxStreamAttemptsPerEndpoint; streamAttempt++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if beforeAttempt != nil {
+				if err := beforeAttempt(); err != nil {
+					if lastErr != nil {
+						return fmt.Errorf("%w: last upstream error: %v", err, lastErr)
+					}
+					return err
+				}
+			}
 			// Requests and bodies cannot be reused after an HTTP attempt.
-			req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+			req, err := http.NewRequestWithContext(ctx, "POST", epURL, bytes.NewReader(reqBody))
 			if err != nil {
 				lastErr = err
 				continue endpointLoop
@@ -557,6 +597,9 @@ endpointLoop:
 
 			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				lastErr = err
 				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 				if !isRetryableStreamError(err) {
@@ -595,6 +638,9 @@ endpointLoop:
 			logger.Warnf("[KiroStream] endpoint=%q invocation_id=%s attempt=%d/%d result=error emitted=%t error=%q %s",
 				ep.Name, invocationID, streamAttempt, maxStreamAttemptsPerEndpoint, emitted, err.Error(), diagnostics.summary())
 			lastErr = err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			// "Emitted" deliberately means that an output callback ran. This
 			// conservative boundary also protects buffered/non-stream callers:
 			// retrying after their callback mutated state would concatenate two
@@ -623,7 +669,9 @@ endpointLoop:
 				logger.Warnf("[KiroAPI] Endpoint %s stream failed before any output callback (attempt %d/%d): %v",
 					ep.Name, streamAttempt, maxStreamAttemptsPerEndpoint, err)
 			}
-			streamRetryWait(streamRetryBackoff)
+			if err := streamRetryWait(ctx, streamRetryBackoff); err != nil {
+				return err
+			}
 			if !hasSameEndpointRetry {
 				continue endpointLoop
 			}
@@ -634,6 +682,17 @@ endpointLoop:
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+func waitForStreamRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func isRetryableStreamError(err error) bool {
@@ -684,14 +743,23 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 	var sawReasoning bool
 	var sawAssistantContent bool
 	var sawToolUse bool
+	var stopReason string
 	var completionDetector assistantCompletionDetector
-	var currentToolUse *toolUseState
+	pendingTools := &pendingToolUses{}
 	var pendingToolUse bool
 	var pendingOutputs []bufferedKiroOutput
 	outputsReleased := false
 	defer func() {
 		diagnostics.OutputsReleased = outputsReleased
 		diagnostics.PendingToolUse = pendingToolUse
+		switch {
+		case err == nil:
+			diagnostics.Integrity = "valid"
+		case isKiroStreamIntegrityError(err):
+			diagnostics.Integrity = "invalid"
+		default:
+			diagnostics.Integrity = "error"
+		}
 	}()
 
 	deliverOutput := func(output bufferedKiroOutput) {
@@ -738,7 +806,7 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 	toolCallback := &trackedCallback
 
 	for {
-		// Prelude: 12 bytes (total_len + headers_len + crc)
+		// Prelude: total length, headers length, and prelude CRC.
 		prelude := make([]byte, 12)
 		_, readErr := io.ReadFull(body, prelude)
 		if readErr == io.EOF {
@@ -748,39 +816,49 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 			return emitted, readErr
 		}
 
-		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
-		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
-
-		if totalLength < 16 {
-			continue
+		totalLength := int(eventStreamUint32(prelude[0:4]))
+		headersLength := int(eventStreamUint32(prelude[4:8]))
+		if totalLength < 16 || totalLength > maxEventStreamMessageSize {
+			return emitted, fmt.Errorf("%w: invalid frame length %d", errInvalidKiroEventStream, totalLength)
+		}
+		if headersLength > totalLength-16 {
+			return emitted, fmt.Errorf("%w: invalid headers length %d", errInvalidKiroEventStream, headersLength)
+		}
+		if got, want := eventStreamUint32(prelude[8:12]), crc32.ChecksumIEEE(prelude[:8]); got != want {
+			return emitted, fmt.Errorf("%w: prelude CRC mismatch", errInvalidKiroEventStream)
 		}
 
-		// Read the remaining message bytes.
-		remaining := totalLength - 12
-		msgBuf := make([]byte, remaining)
-		_, err = io.ReadFull(body, msgBuf)
-		if err != nil {
+		message := make([]byte, totalLength-len(prelude))
+		if _, err = io.ReadFull(body, message); err != nil {
 			return emitted, err
 		}
-
-		if headersLength > len(msgBuf)-4 {
-			continue
+		if got, want := eventStreamUint32(message[len(message)-4:]), eventStreamChecksum(prelude, message[:len(message)-4]); got != want {
+			return emitted, fmt.Errorf("%w: message CRC mismatch", errInvalidKiroEventStream)
 		}
 
-		eventType := extractEventType(msgBuf[0:headersLength])
+		headers, headerErr := parseEventStreamHeaders(message[:headersLength])
+		if headerErr != nil {
+			return emitted, fmt.Errorf("%w: %v", errInvalidKiroEventStream, headerErr)
+		}
+		eventType := headers[":event-type"]
 		diagnostics.FrameCount++
 		diagnostics.LastEventType = eventType
 		if callback.OnProgress != nil {
 			callback.OnProgress()
 		}
-		payloadBytes := msgBuf[headersLength : len(msgBuf)-4]
-		if len(payloadBytes) == 0 {
-			continue
+		payloadBytes := message[headersLength : len(message)-4]
+		event := make(map[string]interface{})
+		if len(payloadBytes) > 0 {
+			if err := json.Unmarshal(payloadBytes, &event); err != nil {
+				return emitted, fmt.Errorf("%w: decode payload: %v", errInvalidKiroEventStream, err)
+			}
 		}
-
-		var event map[string]interface{}
-		if err := json.Unmarshal(payloadBytes, &event); err != nil {
-			continue
+		if messageType := headers[":message-type"]; messageType == "error" || messageType == "exception" {
+			detail := firstStringField(event, "message", "errorMessage", "error")
+			if detail == "" {
+				detail = messageType
+			}
+			return emitted, fmt.Errorf("%w: %s", errKiroEventStreamUpstream, detail)
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
@@ -832,12 +910,10 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 					diagnostics.ToolInputBytes += len(data)
 				}
 			}
-			nextToolUse, toolErr := handleToolUseEvent(event, currentToolUse, toolCallback)
-			if toolErr != nil {
+			if toolErr := handleToolUseEvent(event, pendingTools, toolCallback); toolErr != nil {
 				return emitted, toolErr
 			}
-			currentToolUse = nextToolUse
-			pendingToolUse = currentToolUse != nil
+			pendingToolUse = pendingTools.len() > 0
 		case "meteringEvent":
 			diagnostics.MeteringEvents++
 			if usage, ok := event["usage"].(float64); ok {
@@ -848,23 +924,38 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
 			}
+		case "metadataEvent":
+			diagnostics.MetadataEvents++
+			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+				stopReason = reason
+				diagnostics.StopReason = reason
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(reason)
+				}
+			}
 		}
 	}
 
-	if currentToolUse != nil {
-		if err := finishToolUse(currentToolUse, toolCallback); err != nil {
+	if pendingTools.len() > 0 {
+		if err := pendingTools.flushAll(toolCallback); err != nil {
 			return emitted, err
 		}
-		currentToolUse = nil
+		pendingToolUse = false
 	}
 
-	if !sawOutput {
+	if !sawOutput && !isExplicitKiroTerminalReason(stopReason) {
 		return emitted, errEmptyKiroStream
 	}
 
 	hasFinalAssistantText := completionDetector.hasText
-	if !hasFinalAssistantText && !sawToolUse && (sawReasoning || sawAssistantContent) {
+	if !hasFinalAssistantText && !sawToolUse && (sawReasoning || sawAssistantContent) && !isExplicitKiroTerminalReason(stopReason) {
 		return emitted, errIncompleteKiroResponse
+	}
+	if !sawToolUse && strings.TrimSpace(stopReason) == "" {
+		return emitted, errUpstreamTruncatedResponse
+	}
+	if !sawToolUse && !isKnownKiroStopReason(stopReason) {
+		return emitted, fmt.Errorf("%w: unknown stop reason %q", errInvalidKiroEventStream, stopReason)
 	}
 	releasePendingOutputs()
 
@@ -1047,52 +1138,144 @@ type toolUseState struct {
 	GeneratedID bool
 }
 
-func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) (*toolUseState, error) {
+// pendingToolUses keeps interleaved tool fragments independent while preserving
+// arrival order for clients that execute calls sequentially.
+type pendingToolUses struct {
+	byID   map[string]*toolUseState
+	order  []string
+	lastID string
+}
+
+func (p *pendingToolUses) len() int {
+	return len(p.order)
+}
+
+func (p *pendingToolUses) get(id string) *toolUseState {
+	if p.byID == nil {
+		return nil
+	}
+	return p.byID[id]
+}
+
+func (p *pendingToolUses) add(state *toolUseState) {
+	if p.byID == nil {
+		p.byID = make(map[string]*toolUseState)
+	}
+	p.byID[state.ToolUseID] = state
+	p.order = append(p.order, state.ToolUseID)
+	p.lastID = state.ToolUseID
+}
+
+func (p *pendingToolUses) rekey(state *toolUseState, newID string) {
+	oldID := state.ToolUseID
+	delete(p.byID, oldID)
+	for i, id := range p.order {
+		if id == oldID {
+			p.order[i] = newID
+			break
+		}
+	}
+	state.ToolUseID = newID
+	state.GeneratedID = false
+	p.byID[newID] = state
+	if p.lastID == oldID {
+		p.lastID = newID
+	}
+}
+
+func (p *pendingToolUses) remove(id string) {
+	delete(p.byID, id)
+	for i, existing := range p.order {
+		if existing == id {
+			p.order = append(p.order[:i], p.order[i+1:]...)
+			break
+		}
+	}
+	if p.lastID == id {
+		p.lastID = ""
+		if len(p.order) > 0 {
+			p.lastID = p.order[len(p.order)-1]
+		}
+	}
+}
+
+func (p *pendingToolUses) flushAll(callback *KiroStreamCallback) error {
+	order := p.order
+	byID := p.byID
+	p.byID = nil
+	p.order = nil
+	p.lastID = ""
+	for _, id := range order {
+		state := byID[id]
+		if state == nil {
+			continue
+		}
+		if err := finishToolUse(state, callback); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func handleToolUseEvent(event map[string]interface{}, pending *pendingToolUses, callback *KiroStreamCallback) error {
 	toolUseID := firstStringField(event, "toolUseId", "toolUseID", "tool_use_id", "id")
 	name := firstStringField(event, "name", "toolName", "tool_name")
 	isStop := firstBoolField(event, "stop", "isStop", "done")
 
-	if toolUseID != "" && name != "" {
-		if current == nil {
-			current = &toolUseState{ToolUseID: toolUseID, Name: name}
-		} else if current.ToolUseID != toolUseID {
-			if current.GeneratedID && current.Name == name {
-				current.ToolUseID = toolUseID
-				current.GeneratedID = false
-			} else {
-				if err := finishToolUse(current, callback); err != nil {
-					return current, err
-				}
-				current = &toolUseState{ToolUseID: toolUseID, Name: name}
+	var state *toolUseState
+	switch {
+	case toolUseID != "":
+		state = pending.get(toolUseID)
+		if state == nil && pending.lastID != "" {
+			if previous := pending.get(pending.lastID); previous != nil && previous.GeneratedID && (name == "" || previous.Name == name) {
+				pending.rekey(previous, toolUseID)
+				state = previous
 			}
 		}
-	} else if name != "" && current == nil {
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
-	} else if name != "" && current != nil && current.Name != name {
-		if err := finishToolUse(current, callback); err != nil {
-			return current, err
+		if state == nil {
+			if name == "" {
+				return nil
+			}
+			state = &toolUseState{ToolUseID: toolUseID, Name: name}
+			pending.add(state)
+		} else {
+			if name != "" && state.Name == "" {
+				state.Name = name
+			}
+			pending.lastID = state.ToolUseID
 		}
-		current = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+	case pending.lastID != "" && pending.get(pending.lastID) != nil:
+		state = pending.get(pending.lastID)
+		if name != "" && state.Name != name {
+			if err := finishToolUse(state, callback); err != nil {
+				return err
+			}
+			pending.remove(state.ToolUseID)
+			state = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+			pending.add(state)
+		}
+	case name != "":
+		state = &toolUseState{ToolUseID: "toolu_" + uuid.New().String(), Name: name, GeneratedID: true}
+		pending.add(state)
+	default:
+		return nil
 	}
 
-	if current != nil {
-		if input, ok := event["input"].(string); ok {
-			current.InputBuffer.WriteString(input)
-		} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
-			data, _ := json.Marshal(inputObj)
-			current.InputBuffer.Reset()
-			current.InputBuffer.Write(data)
-		}
+	if input, ok := event["input"].(string); ok {
+		state.InputBuffer.WriteString(input)
+	} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
+		data, _ := json.Marshal(inputObj)
+		state.InputBuffer.Reset()
+		state.InputBuffer.Write(data)
 	}
 
-	if isStop && current != nil {
-		if err := finishToolUse(current, callback); err != nil {
-			return current, err
+	if isStop {
+		if err := finishToolUse(state, callback); err != nil {
+			return err
 		}
-		return nil, nil
+		pending.remove(state.ToolUseID)
 	}
-
-	return current, nil
+	return nil
 }
 
 func finishToolUse(state *toolUseState, callback *KiroStreamCallback) error {
@@ -1138,6 +1321,76 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 		}
 	}
 	return false
+}
+
+func eventStreamUint32(data []byte) uint32 {
+	return uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
+}
+
+func eventStreamChecksum(prelude, message []byte) uint32 {
+	checksum := crc32.Update(0, crc32.IEEETable, prelude)
+	return crc32.Update(checksum, crc32.IEEETable, message)
+}
+
+func parseEventStreamHeaders(data []byte) (map[string]string, error) {
+	headers := make(map[string]string)
+	for offset := 0; offset < len(data); {
+		nameLength := int(data[offset])
+		offset++
+		if nameLength == 0 || offset+nameLength >= len(data) {
+			return nil, errors.New("malformed event header name")
+		}
+		name := string(data[offset : offset+nameLength])
+		offset += nameLength
+		valueType := data[offset]
+		offset++
+
+		valueLength := 0
+		switch valueType {
+		case 0, 1:
+			continue
+		case 2:
+			valueLength = 1
+		case 3:
+			valueLength = 2
+		case 4:
+			valueLength = 4
+		case 5, 8:
+			valueLength = 8
+		case 9:
+			valueLength = 16
+		case 6, 7:
+			if offset+2 > len(data) {
+				return nil, errors.New("malformed variable event header")
+			}
+			valueLength = int(data[offset])<<8 | int(data[offset+1])
+			offset += 2
+		default:
+			return nil, fmt.Errorf("unsupported event header type %d", valueType)
+		}
+		if offset+valueLength > len(data) {
+			return nil, errors.New("truncated event header value")
+		}
+		if valueType == 7 {
+			headers[name] = string(data[offset : offset+valueLength])
+		}
+		offset += valueLength
+	}
+	return headers, nil
+}
+
+func normalizeKiroStopReason(reason string) string {
+	return strings.ToUpper(strings.TrimSpace(reason))
+}
+
+func isKnownKiroStopReason(reason string) bool {
+	switch normalizeKiroStopReason(reason) {
+	case "END_TURN", "MAX_TOKENS", "MAX_OUTPUT_TOKENS", "CONTEXT_WINDOW_EXCEEDED",
+		"CONTENT_FILTERED", "GUARDRAIL_INTERVENED", "PAUSE_TURN", "TOOL_USE":
+		return true
+	default:
+		return false
+	}
 }
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.

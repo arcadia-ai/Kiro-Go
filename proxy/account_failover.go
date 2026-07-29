@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"strings"
@@ -83,6 +85,13 @@ func (h *Handler) disableAccountOverage(account *config.Account) {
 
 func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	if account == nil || err == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	if isSoftKiroCompletionError(err) {
+		logger.Warnf("[AccountFailover] Soft completion/integrity failure for %s; account health unchanged: %v", account.Email, err)
 		return
 	}
 

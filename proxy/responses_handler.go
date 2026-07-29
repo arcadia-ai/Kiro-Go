@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -114,17 +115,17 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -166,7 +167,7 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIContext(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -272,7 +273,7 @@ func buildResponsesObject(
 }
 
 func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -470,7 +471,7 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIContext(ctx, account, payload, callback)
 		if err != nil {
 			if !responseStarted {
 				lastErr = err

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -231,9 +232,10 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		capturedSystem = string(body)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "second reply",
-		}))
+		_, _ = w.Write(bytes.Join([][]byte{
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "second reply"}),
+			awsEventStreamStopFrame(t, "END_TURN"),
+		}, nil))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()
@@ -309,9 +311,10 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "responses non-stream OK",
-		}))
+		_, _ = w.Write(bytes.Join([][]byte{
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "responses non-stream OK"}),
+			awsEventStreamStopFrame(t, "END_TURN"),
+		}, nil))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()
@@ -362,9 +365,10 @@ func TestResponsesStreamSSE(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "stream chunk",
-		}))
+		_, _ = w.Write(bytes.Join([][]byte{
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "stream chunk"}),
+			awsEventStreamStopFrame(t, "END_TURN"),
+		}, nil))
 	}))
 	defer server.Close()
 	defer swapKiroEndpointsForTest(t, server)()

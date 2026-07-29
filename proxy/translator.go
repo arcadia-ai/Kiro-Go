@@ -47,8 +47,10 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 const toolExecutionContinuityPrompt = `<tool_execution_continuity>
 When tools are available and the user asks you to perform work, continue using them until the requested task is complete or you are genuinely blocked and need user input.
 Do not end a turn with a progress update, plan, or statement of the next action. Perform that action with the available tools in the same turn instead.
-Return a final text-only response only after completing the task, or when you must ask the user a specific blocking question.
+When a completion-control tool is available, use it instead of returning a terminal text response directly.
 </tool_execution_continuity>`
+
+const defaultInternalFinishToolName = "kiro_go_finish_task"
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
@@ -236,7 +238,16 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// Only inject tool-loop guidance when Kiro will receive client tools.
 	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, len(kiroTools) > 0)
+	toolCapable := len(kiroTools) > 0
+	internalFinishToolName := ""
+	if toolCapable {
+		internalFinishToolName = reserveInternalFinishToolName(kiroTools, toolNameMap)
+		kiroTools = append(kiroTools, buildInternalFinishTool(internalFinishToolName))
+	}
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, toolCapable)
+	if internalFinishToolName != "" {
+		systemPrompt += "\n\n" + buildCompletionContractPrompt(internalFinishToolName)
+	}
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -335,6 +346,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
+	payload.StrictCompletion = toolCapable
+	payload.InternalFinishToolName = internalFinishToolName
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
@@ -374,6 +387,56 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
+}
+
+func reserveInternalFinishToolName(tools []KiroToolWrapper, toolNameMap map[string]string) string {
+	used := make(map[string]struct{}, len(tools)+len(toolNameMap))
+	for _, tool := range tools {
+		used[tool.ToolSpecification.Name] = struct{}{}
+	}
+	for _, original := range toolNameMap {
+		used[original] = struct{}{}
+	}
+	for suffix := 0; ; suffix++ {
+		candidate := defaultInternalFinishToolName
+		if suffix > 0 {
+			candidate = fmt.Sprintf("%s_%d", defaultInternalFinishToolName, suffix)
+		}
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
+}
+
+func buildInternalFinishTool(name string) KiroToolWrapper {
+	tool := KiroToolWrapper{}
+	tool.ToolSpecification.Name = name
+	tool.ToolSpecification.Description = "Finish the current task only after all requested work is complete or a specific blocker requires user input."
+	tool.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"status": map[string]interface{}{
+				"type": "string",
+				"enum": []interface{}{"completed", "blocked"},
+			},
+			"message": map[string]interface{}{
+				"type":        "string",
+				"description": "Final answer for completed work, or the exact question that must be answered to unblock it.",
+			},
+		},
+		"required": []interface{}{"status", "message"},
+	}}
+	return tool
+}
+
+func buildCompletionContractPrompt(toolName string) string {
+	return fmt.Sprintf(`<kiro_go_completion_contract>
+For this tool-enabled task, ordinary assistant text is never a valid terminal response.
+Continue by calling the available client tools whenever more work can be performed.
+Only when all requested work is complete, or a concrete blocker requires user input, call %s.
+Use status "completed" with the final answer, or status "blocked" with the exact blocking question, and put that user-facing response in message.
+Do not call %s merely to report progress or describe the next action.
+</kiro_go_completion_contract>`, toolName, toolName)
 }
 
 func buildClaudeSystemPrompt(system interface{}, thinking, toolCapable bool) string {
@@ -1026,7 +1089,7 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model, upstreamStopReason string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
@@ -1052,10 +1115,7 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 		})
 	}
 
-	stopReason := "end_turn"
-	if len(toolUses) > 0 {
-		stopReason = "tool_use"
-	}
+	stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses) > 0)
 
 	return &ClaudeResponse{
 		ID:         "msg_" + uuid.New().String(),
@@ -1068,6 +1128,28 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
 		},
+	}
+}
+
+func mapClaudeStopReason(reason string, hasToolUse bool) string {
+	if hasToolUse {
+		return "tool_use"
+	}
+	switch normalizeKiroStopReason(reason) {
+	case "END_TURN":
+		return "end_turn"
+	case "MAX_TOKENS", "MAX_OUTPUT_TOKENS":
+		return "max_tokens"
+	case "CONTEXT_WINDOW_EXCEEDED":
+		return "model_context_window_exceeded"
+	case "CONTENT_FILTERED", "GUARDRAIL_INTERVENED":
+		return "refusal"
+	case "PAUSE_TURN":
+		return "pause_turn"
+	case "TOOL_USE":
+		return "tool_use"
+	default:
+		return ""
 	}
 }
 
@@ -2193,8 +2275,8 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
-	finishReason := "stop"
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat, upstreamStopReason string) map[string]interface{} {
+	finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolUses) > 0)
 
 	message := map[string]interface{}{
 		"role": "assistant",
@@ -2215,7 +2297,6 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			}
 		}
 		message["tool_calls"] = toolCalls
-		finishReason = "tool_calls"
 	} else {
 		// 根据配置格式化 thinking 输出
 		if reasoningContent != "" {
@@ -2248,5 +2329,23 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			"completion_tokens": outputTokens,
 			"total_tokens":      inputTokens + outputTokens,
 		},
+	}
+}
+
+func mapOpenAIFinishReason(reason string, hasToolUse bool) string {
+	if hasToolUse {
+		return "tool_calls"
+	}
+	switch normalizeKiroStopReason(reason) {
+	case "END_TURN", "PAUSE_TURN":
+		return "stop"
+	case "MAX_TOKENS", "MAX_OUTPUT_TOKENS", "CONTEXT_WINDOW_EXCEEDED":
+		return "length"
+	case "CONTENT_FILTERED", "GUARDRAIL_INTERVENED":
+		return "content_filter"
+	case "TOOL_USE":
+		return "tool_calls"
+	default:
+		return ""
 	}
 }

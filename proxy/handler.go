@@ -204,7 +204,7 @@ func matchClaudeProgressOnlyResponse(text string) (string, bool) {
 }
 
 func shouldRejectClaudeProgressOnly(payload *KiroPayload, outputContent string, toolUses []KiroToolUse) (string, bool) {
-	if payload == nil || len(toolUses) > 0 {
+	if payload == nil || payload.StrictCompletion || len(toolUses) > 0 {
 		return "", false
 	}
 	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
@@ -1086,7 +1086,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// and returns client tool_use blocks as-is.
 	if hasWebSearchAmongTools(&req) {
 		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
-		h.runWebSearchLoop(w, &req, thinking, estimatedInputTokens, apiKeyID)
+		h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
 		return
 	}
 
@@ -1095,14 +1095,17 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+	if payload != nil && payload.StrictCompletion {
+		ctx = withClaudeCompletionBudget(ctx)
+	}
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1176,6 +1179,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1486,11 +1490,26 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroForClaude(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			if isSoftKiroCompletionError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				stopHeartbeat("completion_contract_error")
+				stream.send("error", map[string]interface{}{
+					"type":  "error",
+					"error": map[string]string{"type": "api_error", "message": err.Error()},
+				})
+				return
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
@@ -1545,9 +1564,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
+		stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses) > 0)
+		if stopReason == "" {
+			err := fmt.Errorf("%w: missing or unknown stop reason %q", errClaudeCompletionContract, upstreamStopReason)
+			h.recordFailureWithDetails("claude", model, account.ID, err)
+			stopHeartbeat("invalid_stop_reason")
+			stream.send("error", map[string]interface{}{
+				"type":  "error",
+				"error": map[string]string{"type": "api_error", "message": err.Error()},
+			})
+			return
 		}
 
 		// Stop the asynchronous ping loop before the terminal SSE events so a
@@ -1823,7 +1849,10 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+	if payload != nil && payload.StrictCompletion {
+		ctx = withClaudeCompletionBudget(ctx)
+	}
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1847,6 +1876,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1869,11 +1899,22 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroForClaude(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			if isSoftKiroCompletionError(err) {
+				h.recordFailureWithDetails("claude", model, account.ID, err)
+				h.sendClaudeError(w, 500, "api_error", err.Error())
+				return
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1920,7 +1961,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses) > 0)
+		if stopReason == "" {
+			err := fmt.Errorf("%w: missing or unknown stop reason %q", errClaudeCompletionContract, upstreamStopReason)
+			h.recordFailureWithDetails("claude", model, account.ID, err)
+			h.sendClaudeError(w, 500, "api_error", err.Error())
+			return
+		}
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
@@ -1989,14 +2037,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2032,6 +2080,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -2306,9 +2355,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIContext(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2349,9 +2401,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		finishReason := "stop"
-		if len(toolCalls) > 0 {
-			finishReason = "tool_calls"
+		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolCalls) > 0)
+		if finishReason == "" {
+			err := fmt.Errorf("missing or unknown upstream stop reason %q", upstreamStopReason)
+			h.recordFailureWithDetails("openai", model, account.ID, err)
+			return
 		}
 
 		chunk := map[string]interface{}{
@@ -2387,7 +2441,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2410,6 +2464,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2425,9 +2480,12 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIContext(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2455,7 +2513,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolUses) > 0)
+		if finishReason == "" {
+			err := fmt.Errorf("missing or unknown upstream stop reason %q", upstreamStopReason)
+			h.recordFailureWithDetails("openai", model, account.ID, err)
+			h.sendOpenAIError(w, 500, "server_error", err.Error())
+			return
+		}
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, upstreamStopReason)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -4364,7 +4429,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnContextUsage: func(pct float64) {},
 	}
 
-	err := CallKiroAPI(account, kiroPayload, callback)
+	err := CallKiroAPIContext(r.Context(), account, kiroPayload, callback)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

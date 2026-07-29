@@ -323,7 +323,7 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 }
 
 func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
-	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6")
+	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6", "END_TURN")
 
 	if len(resp.Content) != 2 {
 		t.Fatalf("expected empty thinking block plus text block, got %d blocks", len(resp.Content))

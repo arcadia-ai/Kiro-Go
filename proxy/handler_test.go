@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -280,9 +281,10 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": "retried successfully",
-		}))
+		_, _ = w.Write(bytes.Join([][]byte{
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "retried successfully"}),
+			awsEventStreamStopFrame(t, "END_TURN"),
+		}, nil))
 	}))
 	defer server.Close()
 
@@ -313,7 +315,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -375,6 +377,7 @@ func TestClaudeStreamRetriesThinkingOnlyBeforeSendingSSE(t *testing.T) {
 			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 				"content": "recovered response",
 			}),
+			awsEventStreamStopFrame(t, "END_TURN"),
 		}, nil))
 	}))
 	defer server.Close()
@@ -402,7 +405,7 @@ func TestClaudeStreamRetriesThinkingOnlyBeforeSendingSSE(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeStream(rec, payload, "claude-opus-4.7", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
+	h.handleClaudeStream(context.Background(), rec, payload, "claude-opus-4.7", true, claudeThinkingResponseOptions{Format: "thinking"}, 1, nil, "")
 
 	body := rec.Body.String()
 	if calls != 2 {
@@ -448,9 +451,10 @@ func TestClaudeStreamProgressGuardEmitsErrorWithoutTerminalEvents(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
-			"content": progressText,
-		}))
+		_, _ = w.Write(bytes.Join([][]byte{
+			awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": progressText}),
+			awsEventStreamStopFrame(t, "END_TURN"),
+		}, nil))
 	}))
 	defer server.Close()
 
@@ -479,7 +483,7 @@ func TestClaudeStreamProgressGuardEmitsErrorWithoutTerminalEvents(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeStream(rec, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+	h.handleClaudeStream(context.Background(), rec, payload, "claude-opus-5", false, claudeThinkingResponseOptions{}, 1, nil, "")
 
 	body := rec.Body.String()
 	if calls != 1 {

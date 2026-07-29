@@ -10,7 +10,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -33,7 +35,48 @@ type webSearchRoundOutcome struct {
 }
 
 // runWebSearchLoop is the mixed-tools entry point.
-func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, req *ClaudeRequest, thinking bool, estimatedInputTokens int, apiKeyID string) {
+	ctx = withClaudeCompletionBudget(ctx)
+	var heartbeat *claudeSSEHeartbeat
+	var heartbeatStream *claudeSSEStream
+	heartbeatStopped := false
+	heartbeatMessageID := "msg_" + uuid.New().String()
+	stopHeartbeat := func(result string) {
+		if heartbeat == nil || heartbeatStopped {
+			return
+		}
+		heartbeatStopped = true
+		if count := heartbeat.Stop(); count > 0 {
+			logger.Infof("[ClaudeHeartbeat] message_id=%s model=%q result=%s heartbeats=%d", heartbeatMessageID, req.Model, result, count)
+		}
+	}
+	defer stopHeartbeat("handler_exit")
+
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
+			return
+		}
+		heartbeatStream = newClaudeSSEStream(w, flusher)
+		heartbeat = startClaudeSSEHeartbeat(heartbeatStream, claudeSSEHeartbeatInterval)
+	}
+
+	sendLoopError := func(status int, errType, message string) {
+		if heartbeatStream == nil {
+			h.sendClaudeError(w, status, errType, message)
+			return
+		}
+		stopHeartbeat("request_error")
+		heartbeatStream.send("error", map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": errType, "message": message},
+		})
+	}
+
 	// Working copy of messages we will mutate as we feed search results back.
 	working := *req
 	working.Messages = append([]ClaudeMessage(nil), req.Messages...)
@@ -50,8 +93,12 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 	// Allow one extra iteration so a terminal flush can run after the last
 	// search-only round (same pattern as 0..=MAX_WEB_SEARCH_ROUNDS in kiro-rs).
 	for roundIdx := 0; roundIdx <= maxUses; roundIdx++ {
-		round, account, err := h.callUpstreamForWebSearch(&working, thinking, fallbackInput)
+		round, account, err := h.callUpstreamForWebSearch(ctx, &working, thinking, fallbackInput)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				stopHeartbeat("client_cancelled")
+				return
+			}
 			logger.Warnf("[WebSearchLoop] upstream round %d failed: %v", roundIdx, err)
 			accountID := ""
 			if account != nil {
@@ -67,7 +114,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 				status = 429
 				errType = "rate_limit_error"
 			}
-			h.sendClaudeError(w, status, errType, err.Error())
+			sendLoopError(status, errType, err.Error())
 			return
 		}
 		if account != nil {
@@ -83,7 +130,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
 				h.recordFailureWithDetails("claude", req.Model, lastAccountID, searchErr)
-				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+searchErr.Error())
+				sendLoopError(502, "api_error", "Web search failed: "+searchErr.Error())
 				return
 			}
 			searchCount += roundSearchN
@@ -107,7 +154,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
 				h.recordFailureWithDetails("claude", req.Model, lastAccountID, sErr)
-				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+sErr.Error())
+				sendLoopError(502, "api_error", "Web search failed: "+sErr.Error())
 				return
 			}
 			searched[i] = results
@@ -130,6 +177,7 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		h.recordSuccessLog("claude", req.Model, lastAccountID, inputTokens+outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
 
 		if req.Stream {
+			stopHeartbeat("complete")
 			h.renderWebSearchLoopSSE(w, req.Model, content, stopReason, inputTokens, outputTokens)
 			return
 		}
@@ -137,11 +185,11 @@ func (h *Handler) runWebSearchLoop(w http.ResponseWriter, req *ClaudeRequest, th
 		return
 	}
 
-	h.sendClaudeError(w, 500, "api_error", "web_search loop exited unexpectedly")
+	sendLoopError(500, "api_error", "web_search loop exited unexpectedly")
 }
 
 // callUpstreamForWebSearch converts the Claude request and buffers one Kiro stream.
-func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, estimatedInputTokens int) (*webSearchRoundOutcome, *config.Account, error) {
+func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeRequest, thinking bool, estimatedInputTokens int) (*webSearchRoundOutcome, *config.Account, error) {
 	payload := ClaudeToKiro(req, thinking)
 	excluded := make(map[string]bool)
 	var lastErr error
@@ -164,6 +212,7 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 		var credits float64
 		var realInputTokens int
 		var stopOverride string
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(t string, isThinking bool) {
@@ -188,6 +237,9 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 					stopOverride = "model_context_window_exceeded"
 				}
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 			OnError: func(err error) {
 				if err != nil {
 					lastErr = err
@@ -195,9 +247,12 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := callKiroForClaude(ctx, account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isSoftKiroCompletionError(err) {
+				return nil, account, err
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -207,6 +262,11 @@ func (h *Handler) callUpstreamForWebSearch(req *ClaudeRequest, thinking bool, es
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
+		}
+		if mapped := mapClaudeStopReason(upstreamStopReason, len(toolUses) > 0); mapped != "" {
+			stopOverride = mapped
+		} else if stopOverride == "" {
+			return nil, account, fmt.Errorf("missing or unknown upstream stop reason %q", upstreamStopReason)
 		}
 
 		return &webSearchRoundOutcome{
