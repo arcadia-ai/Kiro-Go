@@ -292,27 +292,29 @@ type bufferedKiroOutput struct {
 // content. It is logged once per upstream attempt to diagnose silent
 // truncation while keeping prompts, model output, and credentials private.
 type kiroStreamDiagnostics struct {
-	FrameCount         int
-	LastEventType      string
-	AssistantEvents    int
-	AssistantBytes     int
-	ReasoningEvents    int
-	ReasoningBytes     int
-	ToolEvents         int
-	ToolInputBytes     int
-	CompletedToolUses  int
-	MeteringEvents     int
-	ContextUsageEvents int
-	MetadataEvents     int
-	StopReason         string
-	Integrity          string
-	OutputsReleased    bool
-	PendingToolUse     bool
+	FrameCount                int
+	LastEventType             string
+	AssistantEvents           int
+	AssistantBytes            int
+	ReasoningEvents           int
+	ReasoningBytes            int
+	ToolEvents                int
+	ToolInputBytes            int
+	CompletedToolUses         int
+	MeteringEvents            int
+	ContextUsageEvents        int
+	MetadataEvents            int
+	StopReason                string
+	StopReasonSource          string
+	Integrity                 string
+	OutputsReleased           bool
+	PendingToolUse            bool
+	MissingStopReasonFallback bool
 }
 
 func (d kiroStreamDiagnostics) summary() string {
 	return fmt.Sprintf(
-		"frames=%d last_event=%q assistant_events=%d assistant_bytes=%d reasoning_events=%d reasoning_bytes=%d tool_events=%d tool_input_bytes=%d completed_tools=%d pending_tool=%t metering_events=%d context_usage_events=%d metadata_events=%d stop_reason=%q integrity=%q outputs_released=%t",
+		"frames=%d last_event=%q assistant_events=%d assistant_bytes=%d reasoning_events=%d reasoning_bytes=%d tool_events=%d tool_input_bytes=%d completed_tools=%d pending_tool=%t metering_events=%d context_usage_events=%d metadata_events=%d stop_reason=%q stop_reason_source=%q missing_stop_reason_fallback=%t integrity=%q outputs_released=%t",
 		d.FrameCount,
 		d.LastEventType,
 		d.AssistantEvents,
@@ -327,9 +329,15 @@ func (d kiroStreamDiagnostics) summary() string {
 		d.ContextUsageEvents,
 		d.MetadataEvents,
 		d.StopReason,
+		d.StopReasonSource,
+		d.MissingStopReasonFallback,
 		d.Integrity,
 		d.OutputsReleased,
 	)
+}
+
+type kiroStreamParseOptions struct {
+	AllowMissingStopReasonFallback bool
 }
 
 type assistantCompletionDetector struct {
@@ -628,7 +636,10 @@ endpointLoop:
 			}
 
 			var diagnostics kiroStreamDiagnostics
-			emitted, err := parseEventStreamTrackedWithDiagnostics(resp.Body, callback, &diagnostics)
+			parseOptions := kiroStreamParseOptions{
+				AllowMissingStopReasonFallback: !payload.StrictCompletion,
+			}
+			emitted, err := parseEventStreamTrackedWithOptions(resp.Body, callback, &diagnostics, parseOptions)
 			resp.Body.Close()
 			if err == nil {
 				logger.Infof("[KiroStream] endpoint=%q invocation_id=%s attempt=%d/%d result=complete emitted=%t %s",
@@ -726,6 +737,10 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 }
 
 func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStreamCallback, diagnostics *kiroStreamDiagnostics) (emitted bool, err error) {
+	return parseEventStreamTrackedWithOptions(body, callback, diagnostics, kiroStreamParseOptions{})
+}
+
+func parseEventStreamTrackedWithOptions(body io.Reader, callback *KiroStreamCallback, diagnostics *kiroStreamDiagnostics, options kiroStreamParseOptions) (emitted bool, err error) {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
@@ -929,6 +944,7 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
 				stopReason = reason
 				diagnostics.StopReason = reason
+				diagnostics.StopReasonSource = "upstream"
 				if callback.OnStopReason != nil {
 					callback.OnStopReason(reason)
 				}
@@ -952,7 +968,16 @@ func parseEventStreamTrackedWithDiagnostics(body io.Reader, callback *KiroStream
 		return emitted, errIncompleteKiroResponse
 	}
 	if !sawToolUse && strings.TrimSpace(stopReason) == "" {
-		return emitted, errUpstreamTruncatedResponse
+		if !options.AllowMissingStopReasonFallback || !hasFinalAssistantText {
+			return emitted, errUpstreamTruncatedResponse
+		}
+		stopReason = "END_TURN"
+		diagnostics.StopReason = stopReason
+		diagnostics.StopReasonSource = "compat_fallback"
+		diagnostics.MissingStopReasonFallback = true
+		if callback.OnStopReason != nil {
+			callback.OnStopReason(stopReason)
+		}
 	}
 	if !sawToolUse && !isKnownKiroStopReason(stopReason) {
 		return emitted, fmt.Errorf("%w: unknown stop reason %q", errInvalidKiroEventStream, stopReason)

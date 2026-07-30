@@ -340,6 +340,100 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 }
 
+func TestClaudeNonStreamAcceptsFinalTextWithoutUpstreamStopReason(t *testing.T) {
+	h, payload, calls := setupClaudeMissingStopReasonHandler(t, "probe ok")
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-haiku-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected compatibility response to succeed, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if *calls != 1 {
+		t.Fatalf("expected one upstream call, got %d", *calls)
+	}
+	var resp ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.StopReason != "end_turn" || len(resp.Content) != 1 || resp.Content[0].Text != "probe ok" {
+		t.Fatalf("unexpected compatibility response: %#v", resp)
+	}
+}
+
+func TestClaudeStreamAcceptsFinalTextWithoutUpstreamStopReason(t *testing.T) {
+	h, payload, calls := setupClaudeMissingStopReasonHandler(t, "probe ok")
+
+	rec := httptest.NewRecorder()
+	h.handleClaudeStream(context.Background(), rec, payload, "claude-haiku-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+
+	body := rec.Body.String()
+	if *calls != 1 {
+		t.Fatalf("expected one upstream call, got %d", *calls)
+	}
+	if !strings.Contains(body, "probe ok") || !strings.Contains(body, `"stop_reason":"end_turn"`) ||
+		!strings.Contains(body, "event: message_stop") {
+		t.Fatalf("compatibility stream did not terminate normally, body=%s", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("compatibility stream emitted an API error, body=%s", body)
+	}
+}
+
+func setupClaudeMissingStopReasonHandler(t *testing.T, content string) (*Handler, *KiroPayload, *int) {
+	t.Helper()
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "missing-stop-reason",
+		Enabled:     true,
+		AccessToken: "token-missing-stop-reason",
+		ProfileArn:  "arn:aws:codewhisperer:profile/missing-stop-reason",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": content,
+		}))
+	}))
+	t.Cleanup(server.Close)
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{URL: server.URL, Origin: "AI_EDITOR", Name: "test"}}
+	t.Cleanup(func() { kiroEndpoints = oldEndpoints })
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(&http.Client{Timeout: time.Second, Transport: &http.Transport{}})
+	t.Cleanup(func() { kiroHttpStore.Store(oldClient) })
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "say ok",
+		ModelID: "claude-haiku-4.5",
+		Origin:  "AI_EDITOR",
+	}
+	return h, payload, &calls
+}
+
 func TestClaudeStreamRetriesThinkingOnlyBeforeSendingSSE(t *testing.T) {
 	cfgFile := t.TempDir() + "/config.json"
 	if err := config.Init(cfgFile); err != nil {

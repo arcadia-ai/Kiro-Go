@@ -110,6 +110,81 @@ func TestParseEventStreamStopReasonFieldVariants(t *testing.T) {
 	}
 }
 
+func TestParseEventStreamStrictModeRejectsMissingStopReason(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "done",
+	}))
+
+	var completed int
+	_, err := parseEventStreamTrackedWithOptions(stream, &KiroStreamCallback{
+		OnComplete: func(int, int) { completed++ },
+	}, nil, kiroStreamParseOptions{})
+	if !errors.Is(err, errUpstreamTruncatedResponse) {
+		t.Fatalf("expected missing stop reason error, got %v", err)
+	}
+	if completed != 0 {
+		t.Fatalf("strict response must not complete, got %d callbacks", completed)
+	}
+}
+
+func TestParseEventStreamCompatibilityFallbackForMissingStopReason(t *testing.T) {
+	stream := bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+		"content": "done",
+	}))
+
+	var diagnostics kiroStreamDiagnostics
+	var text, stopReason string
+	var completed int
+	emitted, err := parseEventStreamTrackedWithOptions(stream, &KiroStreamCallback{
+		OnText:       func(chunk string, _ bool) { text += chunk },
+		OnStopReason: func(reason string) { stopReason = reason },
+		OnComplete:   func(int, int) { completed++ },
+	}, &diagnostics, kiroStreamParseOptions{AllowMissingStopReasonFallback: true})
+	if err != nil {
+		t.Fatalf("unexpected compatibility parse error: %v", err)
+	}
+	if !emitted || text != "done" || stopReason != "END_TURN" || completed != 1 {
+		t.Fatalf("emitted=%v text=%q stopReason=%q completed=%d", emitted, text, stopReason, completed)
+	}
+	if diagnostics.StopReason != "END_TURN" || diagnostics.StopReasonSource != "compat_fallback" || !diagnostics.MissingStopReasonFallback {
+		t.Fatalf("unexpected fallback diagnostics: %#v", diagnostics)
+	}
+	if !strings.Contains(diagnostics.summary(), `stop_reason_source="compat_fallback"`) ||
+		!strings.Contains(diagnostics.summary(), "missing_stop_reason_fallback=true") {
+		t.Fatalf("fallback diagnostics missing from summary: %s", diagnostics.summary())
+	}
+}
+
+func TestParseEventStreamCompatibilityFallbackRejectsNonFinalContent(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		payload   map[string]interface{}
+	}{
+		{name: "reasoning only", eventType: "reasoningContentEvent", payload: map[string]interface{}{"text": "thinking"}},
+		{name: "blank assistant text", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "  \n"}},
+		{name: "closed thinking tag", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>plan</thinking>"}},
+		{name: "unclosed thinking tag", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>plan"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := awsEventStreamFrame(t, tc.eventType, tc.payload)
+			var completed int
+			emitted, err := parseEventStreamTrackedWithOptions(bytes.NewReader(frame), &KiroStreamCallback{
+				OnText:     func(string, bool) {},
+				OnComplete: func(int, int) { completed++ },
+			}, nil, kiroStreamParseOptions{AllowMissingStopReasonFallback: true})
+			if !errors.Is(err, errIncompleteKiroResponse) {
+				t.Fatalf("expected incomplete response error, got %v", err)
+			}
+			if emitted || completed != 0 {
+				t.Fatalf("non-final content must not complete, emitted=%v completed=%d", emitted, completed)
+			}
+		})
+	}
+}
+
 func TestKiroStopReasonMappings(t *testing.T) {
 	tests := []struct {
 		upstream string
@@ -919,6 +994,33 @@ func TestCallKiroAPIRetriesReasoningOnlyWithoutLeakingFirstAttempt(t *testing.T)
 	}
 	if got := strings.Join(events, ","); got != "thinking:kept thinking,text:recovered" {
 		t.Fatalf("first attempt leaked or output order changed: %s", got)
+	}
+}
+
+func TestCallKiroAPICompatibilityFallbackForNonStrictPayload(t *testing.T) {
+	var calls, completed int
+	var text, stopReason string
+	installKiroStreamTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return kiroStreamTestResponse(bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "probe ok",
+		}))), nil
+	}))
+
+	err := CallKiroAPI(
+		newKiroRetryTestAPIKeyAccount(""),
+		newKiroRetryTestPayload(),
+		&KiroStreamCallback{
+			OnText:       func(chunk string, _ bool) { text += chunk },
+			OnStopReason: func(reason string) { stopReason = reason },
+			OnComplete:   func(int, int) { completed++ },
+		},
+	)
+	if err != nil {
+		t.Fatalf("unexpected compatibility error: %v", err)
+	}
+	if calls != 1 || text != "probe ok" || stopReason != "END_TURN" || completed != 1 {
+		t.Fatalf("calls=%d text=%q stopReason=%q completed=%d", calls, text, stopReason, completed)
 	}
 }
 
