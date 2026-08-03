@@ -40,8 +40,8 @@ const (
 
 var (
 	errEmptyKiroStream           = errors.New("upstream stream ended before any output")
-	errUpstreamTruncatedResponse = errors.New("upstream truncated response without stop reason")
-	errIncompleteKiroResponse    = errUpstreamTruncatedResponse
+	errUpstreamTruncatedResponse = errors.New("upstream response ended without stop reason")
+	errIncompleteKiroResponse    = errors.New("upstream stream ended without final assistant text or tool use")
 	errIncompleteKiroToolInput   = errors.New("upstream stream ended with incomplete tool input")
 	errInvalidKiroEventStream    = errors.New("invalid upstream event stream")
 	errKiroEventStreamUpstream   = errors.New("upstream event stream error")

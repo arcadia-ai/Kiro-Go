@@ -99,6 +99,22 @@ func callKiroForClaude(ctx context.Context, account *config.Account, payload *Ki
 			if errors.Is(err, errClaudeCompletionRoundsExhausted) {
 				return completionRoundsError(budget.attempts, err)
 			}
+			if errors.Is(err, errUpstreamTruncatedResponse) && strings.TrimSpace(round.text.String()) != "" {
+				recoveryRounds++
+				logger.Warnf("[ClaudeCompletionContract] round=%d outcome=continue cause=missing_stop_reason assistant_bytes=%d recovery_rounds=%d",
+					budget.attempts, len([]byte(round.text.String())), recoveryRounds)
+				observeLegacyProgressRule(working, round.text.String(), round.toolUses, budget.attempts)
+				if budget.attempts >= maxClaudeCompletionRounds {
+					return completionRoundsError(budget.attempts, err)
+				}
+				// Kiro IDE can cleanly end a text response without metadata. Keep
+				// that text as internal progress and ask for a structured terminal
+				// action instead of repeating the unchanged request.
+				if appendErr := appendClaudeCompletionContinuation(working, round, false); appendErr != nil {
+					return fmt.Errorf("%w: build missing-stop continuation: %v", errClaudeCompletionContract, appendErr)
+				}
+				continue
+			}
 			if isKiroStreamIntegrityError(err) {
 				logger.Warnf("[ClaudeCompletionContract] round=%d outcome=continue cause=integrity error=%q", budget.attempts, err.Error())
 				if budget.attempts >= maxClaudeCompletionRounds {
@@ -352,6 +368,7 @@ func isExplicitKiroTerminalReason(reason string) bool {
 func isKiroStreamIntegrityError(err error) bool {
 	return errors.Is(err, errEmptyKiroStream) ||
 		errors.Is(err, errUpstreamTruncatedResponse) ||
+		errors.Is(err, errIncompleteKiroResponse) ||
 		errors.Is(err, errIncompleteKiroToolInput) ||
 		errors.Is(err, errInvalidKiroEventStream) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
@@ -362,7 +379,7 @@ func isSoftKiroCompletionError(err error) bool {
 }
 
 func completionRoundsError(attempts int, cause error) error {
-	return fmt.Errorf("%w after %d control rounds: %v", errClaudeCompletionContract, attempts, cause)
+	return fmt.Errorf("%w after %d control rounds: %w", errClaudeCompletionContract, attempts, cause)
 }
 
 func observeLegacyProgressRule(payload *KiroPayload, text string, toolUses []KiroToolUse, round int) {

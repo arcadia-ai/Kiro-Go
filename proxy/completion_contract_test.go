@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -231,7 +232,7 @@ func TestClaudeCompletionContractClientToolWinsOverInternalFinish(t *testing.T) 
 	}
 }
 
-func TestClaudeCompletionContractMissingStopReasonRetriesOriginalRequest(t *testing.T) {
+func TestClaudeCompletionContractMissingStopReasonContinuesWithBufferedText(t *testing.T) {
 	payload := newStrictCompletionTestPayload()
 	var calls int
 	var requests []KiroPayload
@@ -251,13 +252,87 @@ func TestClaudeCompletionContractMissingStopReasonRetriesOriginalRequest(t *test
 	}))
 	installKiroRetryWait(t, func(time.Duration) {})
 
+	var downstreamText string
+	var downstreamTools []KiroToolUse
+	err := callKiroForClaude(context.Background(), newKiroRetryTestAPIKeyAccount(""), payload, &KiroStreamCallback{
+		OnText:    func(chunk string, _ bool) { downstreamText += chunk },
+		OnToolUse: func(tool KiroToolUse) { downstreamTools = append(downstreamTools, tool) },
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+	if downstreamText != "" || len(downstreamTools) != 1 || downstreamTools[0].Name != "Bash" {
+		t.Fatalf("unaccepted text leaked or accepted tool missing: text=%q tools=%#v", downstreamText, downstreamTools)
+	}
+	if len(requests[1].ConversationState.History) != len(requests[0].ConversationState.History)+2 {
+		t.Fatalf("missing-stop text was not added to continuation history: first=%#v second=%#v", requests[0].ConversationState, requests[1].ConversationState)
+	}
+	history := requests[1].ConversationState.History
+	assistant := history[len(history)-1].AssistantResponseMessage
+	if assistant == nil || assistant.Content != "truncated sentence" {
+		t.Fatalf("missing-stop assistant text not preserved internally: %#v", history)
+	}
+	continuation := requests[1].ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(continuation, "Continue executing the original request now") ||
+		!strings.Contains(continuation, payload.InternalFinishToolName) {
+		t.Fatalf("unexpected continuation instruction: %q", continuation)
+	}
+}
+
+func TestClaudeCompletionContractReasoningOnlyRetriesOriginalRequest(t *testing.T) {
+	payload := newStrictCompletionTestPayload()
+	var calls int
+	var requests []KiroPayload
+	installKiroStreamTestClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		var decoded KiroPayload
+		decodeKiroRequestBody(t, req, &decoded)
+		requests = append(requests, decoded)
+		if calls == 1 {
+			return kiroStreamTestResponse(bytes.NewReader(awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+				"text": "discarded reasoning",
+			}))), nil
+		}
+		return kiroStreamTestResponse(bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "client", "name": "Bash", "input": `{"command":"pwd"}`, "stop": true,
+		}))), nil
+	}))
+	installKiroRetryWait(t, func(time.Duration) {})
+
 	err := callKiroForClaude(context.Background(), newKiroRetryTestAPIKeyAccount(""), payload, &KiroStreamCallback{})
 	if err != nil || calls != 2 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
 	if len(requests[0].ConversationState.History) != len(requests[1].ConversationState.History) ||
 		requests[0].ConversationState.CurrentMessage.UserInputMessage.Content != requests[1].ConversationState.CurrentMessage.UserInputMessage.Content {
-		t.Fatalf("truncated response altered retry payload: first=%#v second=%#v", requests[0].ConversationState, requests[1].ConversationState)
+		t.Fatalf("reasoning-only retry altered payload: first=%#v second=%#v", requests[0].ConversationState, requests[1].ConversationState)
+	}
+}
+
+func TestClaudeCompletionContractMissingStopReasonStopsAfterFourContinuations(t *testing.T) {
+	payload := newStrictCompletionTestPayload()
+	var calls int
+	installKiroStreamTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return kiroStreamTestResponse(bytes.NewReader(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": fmt.Sprintf("partial progress %d", calls),
+		}))), nil
+	}))
+
+	var outputCallbacks, completed int
+	err := callKiroForClaude(context.Background(), newKiroRetryTestAPIKeyAccount(""), payload, &KiroStreamCallback{
+		OnText:     func(string, bool) { outputCallbacks++ },
+		OnToolUse:  func(KiroToolUse) { outputCallbacks++ },
+		OnComplete: func(int, int) { completed++ },
+	})
+	if !errors.Is(err, errClaudeCompletionContract) || !errors.Is(err, errUpstreamTruncatedResponse) {
+		t.Fatalf("expected missing-stop completion contract error, got %v", err)
+	}
+	if calls != maxClaudeCompletionRounds {
+		t.Fatalf("calls=%d, want %d", calls, maxClaudeCompletionRounds)
+	}
+	if outputCallbacks != 0 || completed != 0 {
+		t.Fatalf("unaccepted missing-stop rounds leaked callbacks: output=%d completed=%d", outputCallbacks, completed)
 	}
 }
 
